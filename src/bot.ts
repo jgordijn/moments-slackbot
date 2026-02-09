@@ -12,6 +12,7 @@ import { App, BlockAction, ButtonAction } from "@slack/bolt";
 import { config } from "./config";
 import { reviewMoment, craftMoment } from "./ai";
 import { addMoment, getTodayEntries, todaySlug } from "./github";
+import { convertSlackEmoji } from "./slack-emoji";
 
 export const app = new App({
   token: config.slackBotToken,
@@ -63,7 +64,7 @@ app.message(async ({ message, say }) => {
       await say("💡 Tell me what you'd like to write about! e.g.\n> help me write about discovering a cool new tool");
       return;
     }
-    await handleCraft(idea, say);
+    await handleCraft(convertSlackEmoji(idea), say);
     return;
   }
 
@@ -81,7 +82,7 @@ app.message(async ({ message, say }) => {
   }
 
   // --- Default: treat as a new moment ---
-  await handleNewMoment(text, say);
+  await handleNewMoment(convertSlackEmoji(text), say);
 });
 
 // ---------------------------------------------------------------------------
@@ -138,7 +139,7 @@ app.action<BlockAction<ButtonAction>>("publish_original", async ({ ack, body, cl
   }
 
   pendingProposals.delete(userId);
-  await publishAndConfirm(originalText, body.channel?.id || userId, client);
+  await publishAndConfirm(convertSlackEmoji(originalText), body.channel?.id || userId, client);
 });
 
 // ---------------------------------------------------------------------------
