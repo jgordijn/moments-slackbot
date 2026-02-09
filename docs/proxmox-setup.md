@@ -48,7 +48,8 @@ apk add gcompat libstdc++
 
 # Install Bun
 curl -fsSL https://bun.sh/install | bash
-source /root/.bashrc
+cp /usr/local/bin/bun /usr/local/bin/bun
+chmod 755 /usr/local/bin/bun
 bun --version
 ```
 
@@ -96,7 +97,7 @@ cat > /etc/init.d/moments-bot << 'SCRIPT'
 name="moments-bot"
 description="Moments Slack Bot"
 
-command="/root/.bun/bin/bun"
+command="/usr/local/bin/bun"
 command_args="run src/index.ts"
 command_user="moments:moments"
 directory="/opt/moments-bot"
@@ -153,7 +154,7 @@ tail -50 /var/log/messages
 # Run manually to see output
 cd /opt/moments-bot
 export $(grep -v '^#' .env | xargs)
-/root/.bun/bin/bun run src/index.ts
+/usr/local/bin/bun run src/index.ts
 
 # Restart
 rc-service moments-bot restart
