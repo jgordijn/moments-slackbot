@@ -1,0 +1,19 @@
+{
+  "name": "moments-slackbot",
+  "version": "1.0.0",
+  "description": "A private Slack bot for posting moments to inspired.it",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts"
+  },
+  "dependencies": {
+    "@slack/bolt": "^4.1.0",
+    "@octokit/rest": "^21.0.0",
+    "openai": "^4.77.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.9.3"
+  }
+}
