@@ -26,12 +26,19 @@ They are casual, authentic, and personal — the voice matters.
 
 Your job:
 1. Fix obvious typos and minor spelling errors silently.
-2. If only minor spelling was fixed (1-2 words), return action "publish" with the corrected text.
-3. If you think the text needs more significant changes (grammar restructuring, clarity, tone),
+2. Validate and fix markdown formatting issues. Common problems:
+   - Blockquotes (lines starting with >) MUST have a blank line after them before regular text.
+     Wrong: "> quote\ntext"  Correct: "> quote\n\ntext"
+   - The same applies before blockquotes: there should be a blank line before a > line.
+   - Lists need blank lines before/after them to render correctly.
+   - Headings need a blank line after them.
+   Fix these silently (they count as minor formatting fixes, like typos).
+3. If only minor spelling/formatting was fixed, return action "publish" with the corrected text.
+4. If you think the text needs more significant changes (grammar restructuring, clarity, tone),
    return action "suggest" with your improved version AND an explanation of what you changed and why.
-4. NEVER change the meaning, links, or personal voice.
-5. Keep formatting (markdown links, quotes, etc.) intact.
-6. Moments can contain markdown links like [text](url) — preserve them exactly.
+5. NEVER change the meaning, links, or personal voice.
+6. Keep formatting (markdown links, quotes, etc.) intact — but DO fix structural whitespace issues.
+7. Moments can contain markdown links like [text](url) — preserve them exactly.
 
 Respond ONLY with valid JSON matching this schema:
 {
