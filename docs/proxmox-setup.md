@@ -3,14 +3,13 @@
 ## Step 1: Download the Alpine template (on Proxmox host)
 
 ```bash
-ssh root@<proxmox-ip>
-
 pveam update
 pveam available --section system | grep alpine
-pveam download local template alpine-3.23-default_20260116_amd64.tar.xz
+pveam download local alpine-3.23-default_20260116_amd64.tar.xz
 ```
 
 > Pick the latest version from the list if the filename differs.
+> If `local` doesn't support templates, enable it: `pvesm set local --content images,vztmpl`
 
 ## Step 2: Create the LXC container
 
@@ -30,8 +29,7 @@ pct create 200 local:vztmpl/alpine-3.23-default_20260116_amd64.tar.xz \
   --password
 ```
 
-> Adjust: CT ID `200`, `--storage`, `--net0` bridge/IP to match your setup.
-> 1GB disk is plenty.
+> Change CT ID `200` if already taken.
 
 ## Step 3: Set up the container
 
@@ -63,28 +61,11 @@ adduser -S -G moments -h /opt/moments-bot -s /sbin/nologin moments
 
 ### Deploy the bot
 
-Exit the container (`exit`), then from your Mac:
-
 ```bash
-cd ~/projects/playground-projects/moments-slackbot
-tar czf /tmp/moments-bot.tar.gz src/ package.json bun.lock
-
-scp /tmp/moments-bot.tar.gz root@<proxmox-ip>:/tmp/
-
-ssh root@<proxmox-ip> "
-  pct exec 200 -- mkdir -p /opt/moments-bot
-  pct push 200 /tmp/moments-bot.tar.gz /opt/moments-bot/moments-bot.tar.gz
-  pct exec 200 -- sh -c 'cd /opt/moments-bot && tar xzf moments-bot.tar.gz && rm moments-bot.tar.gz'
-  pct exec 200 -- chown -R moments:moments /opt/moments-bot
-"
-```
-
-### Install node modules
-
-```bash
-pct enter 200
+mkdir -p /opt/moments-bot
 cd /opt/moments-bot
-/root/.bun/bin/bun install --production
+curl -L https://github.com/jgordijn/moments-slackbot/releases/latest/download/moments-bot.tar.gz | tar xz
+bun install --production
 chown -R moments:moments /opt/moments-bot
 ```
 
@@ -95,6 +76,8 @@ cat > /opt/moments-bot/.env << 'EOF'
 SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_APP_TOKEN=xapp-your-app-token
 AUTHORIZED_SLACK_USER_ID=U_YOUR_USER_ID
+GITHUB_OWNER=jgordijn
+GITHUB_REPO=inspired-it-website
 GITHUB_TOKEN=ghp_your_token
 OPENROUTER_API_KEY=sk-or-v1-your-key
 # AI_MODEL=anthropic/claude-sonnet-4
@@ -146,20 +129,13 @@ tail -f /var/log/messages | grep moments
 
 ## Updating the bot
 
-From your Mac:
-
 ```bash
-cd ~/projects/playground-projects/moments-slackbot
-tar czf /tmp/moments-bot.tar.gz src/ package.json bun.lock
-
-scp /tmp/moments-bot.tar.gz root@<proxmox-ip>:/tmp/
-
-ssh root@<proxmox-ip> "
-  pct push 200 /tmp/moments-bot.tar.gz /opt/moments-bot/moments-bot.tar.gz
-  pct exec 200 -- sh -c 'cd /opt/moments-bot && tar xzf moments-bot.tar.gz && rm moments-bot.tar.gz'
-  pct exec 200 -- chown -R moments:moments /opt/moments-bot
-  pct exec 200 -- rc-service moments-bot restart
-"
+pct enter 200
+cd /opt/moments-bot
+curl -L https://github.com/jgordijn/moments-slackbot/releases/latest/download/moments-bot.tar.gz | tar xz
+bun install --production
+chown -R moments:moments /opt/moments-bot
+rc-service moments-bot restart
 ```
 
 ## Troubleshooting
