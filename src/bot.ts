@@ -40,7 +40,10 @@ app.message(async ({ message, say }) => {
   if (message.subtype || !("text" in message) || !message.text) return;
 
   const userId = message.user;
+  console.log(`[message] from=${userId} text="${("text" in message && message.text) ? message.text.slice(0, 50) : ""}..."`);
+
   if (!userId || !isAuthorized(userId)) {
+    console.log(`[auth] rejected user=${userId}`);
     await rejectUnauthorized(say);
     return;
   }
@@ -146,7 +149,10 @@ async function handleNewMoment(text: string, say: Function) {
   await say("🔍 Reviewing your moment...");
 
   try {
+    console.log(`[ai] reviewing moment...`);
+    const start = Date.now();
     const review = await reviewMoment(text);
+    console.log(`[ai] review done in ${Date.now() - start}ms — action=${review.action}`);
 
     if (review.action === "publish") {
       // Minor fixes only — publish directly
@@ -165,7 +171,10 @@ async function handleCraft(idea: string, say: Function) {
   await say("✨ Crafting your moment...");
 
   try {
+    console.log(`[ai] crafting moment...`);
+    const start = Date.now();
     const crafted = await craftMoment(idea);
+    console.log(`[ai] craft done in ${Date.now() - start}ms`);
     await proposeCrafted(crafted, say);
   } catch (err: any) {
     console.error("Error crafting moment:", err);
@@ -188,7 +197,10 @@ async function handleShowToday(say: Function) {
 }
 
 async function publishAndNotify(text: string, say: Function) {
+  console.log(`[github] publishing moment...`);
+  const start = Date.now();
   const result = await addMoment(text);
+  console.log(`[github] done in ${Date.now() - start}ms — created=${result.created}`);
   const verb = result.created ? "Created" : "Added to";
   await say(
     `✅ ${verb} today's moments!\n\n` +
