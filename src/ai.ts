@@ -61,8 +61,11 @@ export async function reviewMoment(userText: string): Promise<ReviewResult> {
     ],
   });
 
-  const content = response.choices[0]?.message?.content;
-  if (!content) throw new Error("Empty AI response");
+  const rawContent = response.choices[0]?.message?.content;
+  if (!rawContent) throw new Error("Empty AI response");
+
+  // Strip markdown code fences the model sometimes wraps around JSON
+  const content = rawContent.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
 
   const parsed = JSON.parse(content) as ReviewResult;
 
