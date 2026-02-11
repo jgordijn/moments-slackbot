@@ -177,8 +177,10 @@ Guidelines:
 - Preserve the YAML frontmatter exactly.
 - Preserve all entries you're NOT modifying exactly as they are.
 - Preserve the "---" separators between entries exactly.
-- If the user wants to replace an image and provides a new image path (via NEW_IMAGE_PATH), use that path.
-- If the instruction is ambiguous about WHICH entry to edit, return action "unclear" with a clarification question.
+- When the user wants to replace an image, a new image has already been uploaded by the system. The new image path will be provided in the instruction. Simply replace the old image reference with the new path.
+- "The previous post" or "the last post" means the most recent entry in the most recent file.
+- If the instruction is genuinely ambiguous about WHICH entry to edit (e.g., multiple entries match), return action "unclear" with a clarification question.
+- Do NOT ask the user for file paths or technical details — that's handled by the system.
 - If the edit targets a file more than 2 days old, set a warning like "This edit targets a moment from {date}, which is X days ago. Are you sure?"
 - If the instruction asks for something you can't do (delete the entire file, change dates, etc.), return action "unsupported".
 - Keep the author's voice — don't rewrite things they didn't ask you to change.
@@ -189,7 +191,7 @@ Respond ONLY with valid JSON matching this schema:
   "dateSlug": "YYYY-MM-DD of the file being edited (empty if unclear/unsupported)",
   "updatedContent": "the full updated file content (empty if unclear/unsupported)",
   "explanation": "human-readable summary of the change",
-  "clarification": "question for the user (only if action is unclear)",
+  "clarification": "question for the user (only if action is unclear, keep it simple and non-technical)",
   "unsupportedReason": "why this can't be done (only if action is unsupported)",
   "warning": "warning message if editing old content (empty if none)"
 }`;
@@ -204,11 +206,12 @@ export async function executeInstruction(
     .map((m) => `=== File: ${m.dateSlug}.md ===\n${m.content}`)
     .join("\n\n");
 
-  let userMessage = `Instruction: ${userInstruction}\n\nRecent moment files:\n\n${momentsContext}`;
-
+  let instruction = userInstruction;
   if (newImagePath) {
-    userMessage += `\n\nNEW_IMAGE_PATH: ${newImagePath}`;
+    instruction += `\n\n(The user attached a new image which has been uploaded to: ${newImagePath} — use this path to replace the old image reference.)`;
   }
+
+  const userMessage = `Instruction: ${instruction}\n\nRecent moment files:\n\n${momentsContext}`;
 
   const response = await openai.chat.completions.create({
     model: config.aiModel,

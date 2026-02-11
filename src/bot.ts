@@ -461,6 +461,10 @@ async function handleInstruction(text: string, message: any, say: Function) {
         const match = embeds[0].match(/\!\[.*?\]\((.*?)\)/);
         newImagePath = match ? match[1] : undefined;
         console.log(`[images] new image path for instruction: ${newImagePath}`);
+      } else {
+        // Image upload failed — tell the user directly
+        await say("⚠️ I couldn't process the image you attached. Please try sending your request again with the image.");
+        return;
       }
     }
 
