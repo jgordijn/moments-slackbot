@@ -37,8 +37,11 @@ async function rejectUnauthorized(say: Function) {
 // Message handler (DMs only)
 // ---------------------------------------------------------------------------
 app.message(async ({ message, say }) => {
-  // Only handle user messages (not bot messages, not edits)
-  if (message.subtype || !("text" in message) || !message.text) return;
+  // Only handle user messages (not bot messages, not edits).
+  // Allow "file_share" subtype — these are messages with image attachments
+  // that still contain text (e.g. "Image from iOS").
+  if (message.subtype && message.subtype !== "file_share") return;
+  if (!("text" in message) || !message.text) return;
 
   const userId = message.user;
   console.log(`[message] from=${userId} text="${("text" in message && message.text) ? message.text.slice(0, 50) : ""}..."`);
