@@ -10,7 +10,7 @@
 
 import { App, BlockAction, ButtonAction } from "@slack/bolt";
 import { config } from "./config";
-import { reviewMoment, craftMoment } from "./ai";
+import { reviewMoment, craftMoment, classifyIntent } from "./ai";
 import { addMoment, getTodayEntries, todaySlug, uploadImage } from "./github";
 import { convertSlackEmoji } from "./slack-emoji";
 import { extractImageFiles, processMessageImages, type ProcessedImage } from "./images";
@@ -28,6 +28,13 @@ interface PendingProposal {
   imageEmbeds: string[];
 }
 const pendingProposals = new Map<string, PendingProposal>();
+
+// Store for messages where intent was unclear — needed when user clicks "Publish as moment"
+interface PendingUnclear {
+  text: string;
+  message: any;
+}
+const pendingUnclear = new Map<string, PendingUnclear>();
 
 /** Guard: only allow the authorized user. */
 function isAuthorized(userId: string): boolean {
@@ -137,6 +144,54 @@ app.action<BlockAction<ButtonAction>>("reject_suggestion", async ({ ack, body, c
   });
 });
 
+app.action<BlockAction<ButtonAction>>("treat_as_moment", async ({ ack, body, client }) => {
+  await ack();
+
+  const userId = body.user.id;
+  if (!isAuthorized(userId)) return;
+
+  const pending = pendingUnclear.get(userId);
+  if (!pending) {
+    await client.chat.postMessage({
+      channel: body.channel?.id || userId,
+      text: "⚠️ Couldn't find the original message. Please send it again.",
+    });
+    return;
+  }
+
+  pendingUnclear.delete(userId);
+  const hasImages = "files" in pending.message && extractImageFiles(pending.message).length > 0;
+
+  // Use a wrapper that posts to the channel via client (since we don't have `say`)
+  const sayViaClient = async (msg: any) => {
+    const channel = body.channel?.id || userId;
+    if (typeof msg === "string") {
+      await client.chat.postMessage({ channel, text: msg });
+    } else {
+      await client.chat.postMessage({ channel, ...msg });
+    }
+  };
+
+  await processAsMoment(pending.text, pending.message, hasImages, sayViaClient);
+});
+
+app.action<BlockAction<ButtonAction>>("treat_as_instruction", async ({ ack, body, client }) => {
+  await ack();
+
+  const userId = body.user.id;
+  if (!isAuthorized(userId)) return;
+
+  pendingUnclear.delete(userId);
+  await client.chat.postMessage({
+    channel: body.channel?.id || userId,
+    text: "💬 Got it! I can't do that directly, but here's what I can help with:\n\n" +
+      "• *Send any text* → I'll review and publish it as a moment\n" +
+      "• *help me write about <topic>* → I'll craft a moment for you\n" +
+      "• *show today* → see today's entries\n\n" +
+      "To edit or delete existing moments, you'll need to edit the file directly on GitHub.",
+  });
+});
+
 app.action<BlockAction<ButtonAction>>("publish_original", async ({ ack, body, client }) => {
   await ack();
 
@@ -172,6 +227,85 @@ async function handleNewMoment(text: string, message: any, say: Function) {
   const hasImages = "files" in message && extractImageFiles(message).length > 0;
   const hasText = text.length > 0;
 
+  // Image-only messages skip classification and go straight to publish
+  if (!hasText && hasImages) {
+    await say("🔍 Processing your image(s)...");
+    try {
+      const imageEmbeds = await processAndUploadImages(message);
+      if (imageEmbeds.length === 0) {
+        await say("❌ Couldn't process the image(s). Please try again.");
+        return;
+      }
+      await publishAndNotify(imageEmbeds.join("\n\n"), say);
+    } catch (err: any) {
+      console.error("Error processing images:", err);
+      await say(`❌ Something went wrong: ${err.message}`);
+    }
+    return;
+  }
+
+  // Classify intent: is this a moment to publish or an instruction?
+  try {
+    console.log(`[ai] classifying intent...`);
+    const start = Date.now();
+    const classification = await classifyIntent(text);
+    console.log(`[ai] classified in ${Date.now() - start}ms — intent=${classification.intent}`);
+
+    if (classification.intent === "instruction") {
+      await say(`💬 ${classification.response}`);
+      return;
+    }
+
+    if (classification.intent === "unclear") {
+      // Store the message so we can process it if the user clicks "Publish as moment"
+      pendingUnclear.set(config.authorizedUserId, { text, message });
+      await say({
+        text: "I'm not sure if this is a moment to publish or an instruction for me",
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: "🤔 *Not sure what you'd like me to do:*\n\n" +
+                `> ${text.split("\n").join("\n> ")}\n\n` +
+                "Is this a moment to publish, or an instruction for me?",
+            },
+          },
+          {
+            type: "actions",
+            elements: [
+              {
+                type: "button",
+                text: { type: "plain_text", text: "📝 Publish as moment", emoji: true },
+                style: "primary",
+                action_id: "treat_as_moment",
+              },
+              {
+                type: "button",
+                text: { type: "plain_text", text: "💬 It's an instruction", emoji: true },
+                action_id: "treat_as_instruction",
+              },
+            ],
+          },
+        ],
+      });
+      return;
+    }
+
+    // Intent is "moment" — proceed with the normal flow
+  } catch (err: any) {
+    // If classification fails, default to treating it as a moment
+    console.error(`[ai] classification failed, defaulting to moment: ${err.message}`);
+  }
+
+  // Process as a moment
+  await processAsMoment(text, message, hasImages, say);
+}
+
+/** Process text (and optional images) as a moment — review with AI and publish. */
+async function processAsMoment(text: string, message: any, hasImages: boolean, say: Function) {
+  const hasText = text.length > 0;
+
   if (hasImages && hasText) {
     await say("🔍 Reviewing your moment and processing image(s)...");
   } else if (hasImages) {
@@ -201,7 +335,6 @@ async function handleNewMoment(text: string, message: any, say: Function) {
     // Check if all images failed
     if (hasImages && imageEmbeds.length === 0) {
       if (hasText) {
-        // Publish text-only and warn about images
         console.warn(`[images] all images failed, publishing text only`);
         if (review && review.action === "publish") {
           await publishAndNotify(review.text, say);
