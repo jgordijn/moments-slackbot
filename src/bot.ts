@@ -45,26 +45,62 @@ interface PendingEdit {
 }
 const pendingEdits = new Map<string, PendingEdit>();
 
-// Conversation context for instruction follow-ups (clarification loops)
-interface ConversationContext {
-  originalInstruction: string;
-  originalMessage: any;
-  clarificationQuestion: string;
-  newImagePath?: string;
+// Rolling conversation history per user
+const HISTORY_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+interface HistoryEntry {
+  role: "user" | "bot";
+  text: string;
   timestamp: number;
 }
-const conversationContext = new Map<string, ConversationContext>();
 
-/** Check if a message is likely a follow-up to a clarification question */
-function hasActiveConversation(userId: string): boolean {
-  const ctx = conversationContext.get(userId);
-  if (!ctx) return false;
-  // Expire after 5 minutes
-  if (Date.now() - ctx.timestamp > 5 * 60 * 1000) {
-    conversationContext.delete(userId);
-    return false;
+interface ConversationState {
+  history: HistoryEntry[];
+  /** Uploaded image path preserved across the conversation */
+  newImagePath?: string;
+  /** The original Slack message (for image re-extraction if needed) */
+  lastMessage?: any;
+}
+
+const conversations = new Map<string, ConversationState>();
+
+/** Get conversation state for a user, pruning expired entries. */
+function getConversation(userId: string): ConversationState {
+  let conv = conversations.get(userId);
+  if (!conv) {
+    conv = { history: [] };
+    conversations.set(userId, conv);
   }
-  return true;
+  // Prune entries older than TTL
+  const cutoff = Date.now() - HISTORY_TTL_MS;
+  conv.history = conv.history.filter(e => e.timestamp >= cutoff);
+  return conv;
+}
+
+/** Add a message to the conversation history. */
+function addToHistory(userId: string, role: "user" | "bot", text: string) {
+  const conv = getConversation(userId);
+  conv.history.push({ role, text, timestamp: Date.now() });
+}
+
+/** Clear conversation history (after publish, edit applied, or discard). */
+function clearConversation(userId: string) {
+  conversations.delete(userId);
+}
+
+/** Check if there's recent conversation history (for context-aware handling). */
+function hasConversationHistory(userId: string): boolean {
+  const conv = getConversation(userId);
+  return conv.history.length > 0;
+}
+
+/** Format conversation history for AI context. */
+function formatHistory(userId: string): string {
+  const conv = getConversation(userId);
+  if (conv.history.length === 0) return "";
+  return conv.history
+    .map(e => `${e.role === "user" ? "User" : "Bot"}: ${e.text}`)
+    .join("\n");
 }
 
 /** Guard: only allow the authorized user. */
@@ -135,14 +171,8 @@ app.message(async ({ message, say }) => {
     return;
   }
 
-  // --- Check for active conversation (follow-up to clarification) ---
-  if (text && hasActiveConversation(userId)) {
-    await handleFollowUp(userId, convertSlackEmoji(text), message, say);
-    return;
-  }
-
   // --- Default: treat as a new moment (with optional images) ---
-  await handleNewMoment(text ? convertSlackEmoji(text) : "", message, say);
+  await handleNewMoment(text ? convertSlackEmoji(text) : "", message, say, userId);
 });
 
 // ---------------------------------------------------------------------------
@@ -164,6 +194,7 @@ app.action<BlockAction<ButtonAction>>("accept_suggestion", async ({ ack, body, c
   }
 
   pendingProposals.delete(userId);
+  clearConversation(userId);
   const fullText = combineTextAndImages(proposal.text, proposal.imageEmbeds);
   await publishAndConfirm(fullText, body.channel?.id || userId, client);
 });
@@ -175,6 +206,7 @@ app.action<BlockAction<ButtonAction>>("reject_suggestion", async ({ ack, body, c
   if (!isAuthorized(userId)) return;
 
   pendingProposals.delete(userId);
+  clearConversation(userId);
   await client.chat.postMessage({
     channel: body.channel?.id || userId,
     text: "👍 No worries! Send me the text you'd like to publish, or ask me to help you write it.",
@@ -238,7 +270,7 @@ app.action<BlockAction<ButtonAction>>("treat_as_instruction", async ({ ack, body
     }
   };
 
-  await handleInstruction(pending.text, pending.message, sayViaClient);
+  await handleInstruction(pending.text, pending.message, sayViaClient, userId);
 });
 
 app.action<BlockAction<ButtonAction>>("approve_edit", async ({ ack, body, client }) => {
@@ -257,6 +289,7 @@ app.action<BlockAction<ButtonAction>>("approve_edit", async ({ ack, body, client
   }
 
   pendingEdits.delete(userId);
+  clearConversation(userId);
 
   try {
     console.log(`[github] applying edit to ${edit.dateSlug}...`);
@@ -289,6 +322,7 @@ app.action<BlockAction<ButtonAction>>("reject_edit", async ({ ack, body, client 
   if (!isAuthorized(userId)) return;
 
   pendingEdits.delete(userId);
+  clearConversation(userId);
   await client.chat.postMessage({
     channel: body.channel?.id || userId,
     text: "👍 Edit discarded. Let me know if you'd like to try something else.",
@@ -326,7 +360,7 @@ app.action<BlockAction<ButtonAction>>("publish_original", async ({ ack, body, cl
 // Handlers
 // ---------------------------------------------------------------------------
 
-async function handleNewMoment(text: string, message: any, say: Function) {
+async function handleNewMoment(text: string, message: any, say: Function, userId: string) {
   const hasImages = "files" in message && extractImageFiles(message).length > 0;
   const hasText = text.length > 0;
 
@@ -339,6 +373,7 @@ async function handleNewMoment(text: string, message: any, say: Function) {
         await say("❌ Couldn't process the image(s). Please try again.");
         return;
       }
+      clearConversation(userId);
       await publishAndNotify(imageEmbeds.join("\n\n"), say);
     } catch (err: any) {
       console.error("Error processing images:", err);
@@ -347,21 +382,30 @@ async function handleNewMoment(text: string, message: any, say: Function) {
     return;
   }
 
+  // Record the user message in history
+  addToHistory(userId, "user", text);
+
+  // If there's conversation history, this might be a follow-up to a clarification.
+  // Let the classifier see the history to make a better decision.
+  const history = formatHistory(userId);
+  const hasHistory = hasConversationHistory(userId) && getConversation(userId).history.length > 1;
+
   // Classify intent: is this a moment to publish or an instruction?
   try {
-    console.log(`[ai] classifying intent...`);
+    console.log(`[ai] classifying intent...${hasHistory ? " (with conversation history)" : ""}`);
     const start = Date.now();
-    const classification = await classifyIntent(text);
+    const classification = await classifyIntent(text, hasHistory ? history : undefined);
     console.log(`[ai] classified in ${Date.now() - start}ms — intent=${classification.intent}`);
 
     if (classification.intent === "instruction") {
-      await handleInstruction(text, message, say);
+      await handleInstruction(text, message, say, userId);
       return;
     }
 
     if (classification.intent === "unclear") {
       // Store the message so we can process it if the user clicks "Publish as moment"
-      pendingUnclear.set(config.authorizedUserId, { text, message });
+      pendingUnclear.set(userId, { text, message });
+      addToHistory(userId, "bot", "Asked whether this is a moment or instruction");
       await say({
         text: "I'm not sure if this is a moment to publish or an instruction for me",
         blocks: [
@@ -401,7 +445,8 @@ async function handleNewMoment(text: string, message: any, say: Function) {
     console.error(`[ai] classification failed, defaulting to moment: ${err.message}`);
   }
 
-  // Process as a moment
+  // Process as a moment — clear conversation since we're publishing
+  clearConversation(userId);
   await processAsMoment(text, message, hasImages, say);
 }
 
@@ -473,24 +518,25 @@ async function processAsMoment(text: string, message: any, hasImages: boolean, s
 }
 
 /** Handle an instruction to edit existing moments. */
-async function handleInstruction(text: string, message: any, say: Function) {
+async function handleInstruction(text: string, message: any, say: Function, userId?: string) {
+  const uid = userId || config.authorizedUserId;
   await say("🔧 Working on your request...");
 
   try {
     // If the message has images, upload them first (for image replacement)
     const hasImages = "files" in message && extractImageFiles(message).length > 0;
-    let newImagePath: string | undefined;
+    const conv = getConversation(uid);
+    let newImagePath = conv.newImagePath; // Preserve from earlier in the conversation
 
     if (hasImages) {
       console.log(`[images] instruction includes image(s), uploading...`);
       const embeds = await processAndUploadImages(message);
       if (embeds.length > 0) {
-        // Extract the path from the markdown embed: ![image](/images/moments/...) → /images/moments/...
         const match = embeds[0].match(/\!\[.*?\]\((.*?)\)/);
         newImagePath = match ? match[1] : undefined;
+        conv.newImagePath = newImagePath; // Store for follow-ups
         console.log(`[images] new image path for instruction: ${newImagePath}`);
       } else {
-        // Image upload failed — tell the user directly
         await say("⚠️ I couldn't process the image you attached. Please try sending your request again with the image.");
         return;
       }
@@ -507,30 +553,30 @@ async function handleInstruction(text: string, message: any, say: Function) {
 
     console.log(`[github] found ${recentMoments.length} recent file(s): ${recentMoments.map(m => m.dateSlug).join(", ")}`);
 
+    // Build the instruction with conversation history for context
+    const history = formatHistory(uid);
+    const instructionWithContext = history && conv.history.length > 1
+      ? `Conversation so far:\n${history}\n\nExecute the user's latest request based on this conversation.`
+      : text;
+
     // Ask AI to execute the instruction
-    console.log(`[ai] executing instruction...`);
+    console.log(`[ai] executing instruction...${conv.history.length > 1 ? " (with conversation history)" : ""}`);
     const start = Date.now();
     const result = await executeInstruction(
-      text,
+      instructionWithContext,
       recentMoments.map(m => ({ dateSlug: m.dateSlug, content: m.content })),
       newImagePath,
     );
     console.log(`[ai] instruction done in ${Date.now() - start}ms — action=${result.action}`);
 
     if (result.action === "unsupported") {
+      addToHistory(uid, "bot", result.unsupportedReason);
       await say(`😔 ${result.unsupportedReason}`);
       return;
     }
 
     if (result.action === "unclear") {
-      // Store conversation context so the user's reply is understood as a follow-up
-      conversationContext.set(config.authorizedUserId, {
-        originalInstruction: text,
-        originalMessage: message,
-        clarificationQuestion: result.clarification,
-        newImagePath,
-        timestamp: Date.now(),
-      });
+      addToHistory(uid, "bot", result.clarification);
       await say(`🤔 ${result.clarification}`);
       return;
     }
@@ -543,7 +589,8 @@ async function handleInstruction(text: string, message: any, say: Function) {
     }
 
     // Store the pending edit
-    pendingEdits.set(config.authorizedUserId, {
+    addToHistory(uid, "bot", `Proposed edit: ${result.explanation}`);
+    pendingEdits.set(uid, {
       dateSlug: result.dateSlug,
       updatedContent: result.updatedContent,
       sha: targetFile.sha,
@@ -595,125 +642,6 @@ async function handleInstruction(text: string, message: any, say: Function) {
     });
   } catch (err: any) {
     console.error("Error handling instruction:", err);
-    await say(`❌ Something went wrong: ${err.message}`);
-  }
-}
-
-/** Handle a follow-up message in an active clarification conversation. */
-async function handleFollowUp(userId: string, reply: string, message: any, say: Function) {
-  const ctx = conversationContext.get(userId)!;
-  conversationContext.delete(userId);
-
-  console.log(`[conversation] follow-up to: "${ctx.originalInstruction.slice(0, 50)}..." reply: "${reply.slice(0, 50)}..."`);
-
-  await say("🔧 Working on your request...");
-
-  try {
-    // Check if the follow-up message has new images
-    const hasImages = "files" in message && extractImageFiles(message).length > 0;
-    let newImagePath = ctx.newImagePath;
-
-    if (hasImages && !newImagePath) {
-      console.log(`[images] follow-up includes image(s), uploading...`);
-      const embeds = await processAndUploadImages(message);
-      if (embeds.length > 0) {
-        const match = embeds[0].match(/\!\[.*?\]\((.*?)\)/);
-        newImagePath = match ? match[1] : undefined;
-      }
-    }
-
-    // Fetch recent moments
-    const recentMoments = await getRecentMoments(5);
-    if (recentMoments.length === 0) {
-      await say("📭 No recent moments found to edit.");
-      return;
-    }
-
-    // Build a combined instruction with context
-    const combinedInstruction =
-      `Original request: ${ctx.originalInstruction}\n` +
-      `Bot asked: ${ctx.clarificationQuestion}\n` +
-      `User replied: ${reply}`;
-
-    console.log(`[ai] executing instruction with context...`);
-    const start = Date.now();
-    const result = await executeInstruction(
-      combinedInstruction,
-      recentMoments.map(m => ({ dateSlug: m.dateSlug, content: m.content })),
-      newImagePath,
-    );
-    console.log(`[ai] instruction done in ${Date.now() - start}ms — action=${result.action}`);
-
-    if (result.action === "unsupported") {
-      await say(`😔 ${result.unsupportedReason}`);
-      return;
-    }
-
-    if (result.action === "unclear") {
-      // Still unclear — store context again for another round
-      conversationContext.set(userId, {
-        originalInstruction: ctx.originalInstruction,
-        originalMessage: ctx.originalMessage,
-        clarificationQuestion: result.clarification,
-        newImagePath,
-        timestamp: Date.now(),
-      });
-      await say(`🤔 ${result.clarification}`);
-      return;
-    }
-
-    // action === "edit" — propose the change
-    const targetFile = recentMoments.find(m => m.dateSlug === result.dateSlug);
-    if (!targetFile) {
-      await say(`⚠️ Couldn't find the moment file for ${result.dateSlug}.`);
-      return;
-    }
-
-    pendingEdits.set(userId, {
-      dateSlug: result.dateSlug,
-      updatedContent: result.updatedContent,
-      sha: targetFile.sha,
-      explanation: result.explanation,
-    });
-
-    const blocks: any[] = [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: `✏️ *Proposed edit to ${result.dateSlug}:*\n\n${result.explanation}`,
-        },
-      },
-    ];
-
-    if (result.warning) {
-      blocks.push({
-        type: "section",
-        text: { type: "mrkdwn", text: `⚠️ ${result.warning}` },
-      });
-    }
-
-    blocks.push({
-      type: "actions",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "✅ Apply edit", emoji: true },
-          style: "primary",
-          action_id: "approve_edit",
-        },
-        {
-          type: "button",
-          text: { type: "plain_text", text: "❌ Discard", emoji: true },
-          style: "danger",
-          action_id: "reject_edit",
-        },
-      ],
-    });
-
-    await say({ text: `Proposed edit to ${result.dateSlug}`, blocks });
-  } catch (err: any) {
-    console.error("Error handling follow-up:", err);
     await say(`❌ Something went wrong: ${err.message}`);
   }
 }

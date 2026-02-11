@@ -50,6 +50,7 @@ Guidelines:
 - Questions about what the bot can do are instructions.
 - If the message references a previous post and asks for changes, it's an instruction.
 - Only use "unclear" when it's genuinely 50/50 — not as a safe default.
+- If conversation history is provided, use it for context. Short replies like "2", "the second one", "yes", "that one" are follow-ups to the previous bot question and should be classified as "instruction".
 
 For "instruction" intent, the response field can be empty — the bot will handle execution.
 
@@ -60,7 +61,12 @@ Respond ONLY with valid JSON:
   "response": ""
 }`;
 
-export async function classifyIntent(userText: string): Promise<ClassifyResult> {
+export async function classifyIntent(userText: string, conversationHistory?: string): Promise<ClassifyResult> {
+  let userMessage = userText;
+  if (conversationHistory) {
+    userMessage = `Recent conversation:\n${conversationHistory}\n\nClassify the LATEST user message above.`;
+  }
+
   const response = await openai.chat.completions.create({
     model: config.aiModel,
     temperature: 0.1,
@@ -68,7 +74,7 @@ export async function classifyIntent(userText: string): Promise<ClassifyResult> 
     response_format: { type: "json_object" },
     messages: [
       { role: "system", content: CLASSIFY_SYSTEM_PROMPT },
-      { role: "user", content: userText },
+      { role: "user", content: userMessage },
     ],
   });
 
