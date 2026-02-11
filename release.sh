@@ -2,41 +2,70 @@
 set -euo pipefail
 
 # Release script — bumps version in package.json, commits, tags, and pushes.
-# Usage: ./release.sh <major|minor|patch>
+# Usage: ./release.sh [--force] <major|minor|patch>
 #
 # Example:
-#   ./release.sh patch   # 0.4.0 → 0.4.1
-#   ./release.sh minor   # 0.4.0 → 0.5.0
-#   ./release.sh major   # 0.4.0 → 1.0.0
+#   ./release.sh patch          # 0.5.0 → 0.5.1
+#   ./release.sh minor          # 0.5.0 → 0.6.0
+#   ./release.sh major          # 0.5.0 → 1.0.0
+#   ./release.sh --force patch  # skip dirty working tree check
 #
-# The tag push triggers the GitHub Actions release workflow which
-# packages and publishes a new release.
+# The script pushes all local commits first, then bumps the version,
+# commits, tags, and pushes. The tag push triggers the GitHub Actions
+# release workflow which packages and publishes a new release.
 
-BUMP_TYPE="${1:-}"
+FORCE=false
+BUMP_TYPE=""
+
+# Parse arguments
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=true ;;
+    major|minor|patch) BUMP_TYPE="$arg" ;;
+    *)
+      echo "Error: unknown argument '$arg'"
+      echo "Usage: ./release.sh [--force] <major|minor|patch>"
+      exit 1
+      ;;
+  esac
+done
 
 if [[ -z "$BUMP_TYPE" ]]; then
-  echo "Usage: ./release.sh <major|minor|patch>"
+  echo "Usage: ./release.sh [--force] <major|minor|patch>"
   exit 1
 fi
 
-if [[ "$BUMP_TYPE" != "major" && "$BUMP_TYPE" != "minor" && "$BUMP_TYPE" != "patch" ]]; then
-  echo "Error: argument must be 'major', 'minor', or 'patch'"
-  echo "Usage: ./release.sh <major|minor|patch>"
-  exit 1
-fi
-
-# Ensure we're on main and clean
+# Ensure we're on main
 BRANCH=$(git branch --show-current)
 if [[ "$BRANCH" != "main" ]]; then
   echo "Error: must be on 'main' branch (currently on '$BRANCH')"
   exit 1
 fi
 
-if [[ -n "$(git status --porcelain -- ':!.claude' ':!.pi' ':!openspec')" ]]; then
-  echo "Error: working tree has uncommitted changes (excluding tooling dirs)"
-  echo "Commit or stash changes before releasing."
-  git status --short -- ':!.claude' ':!.pi' ':!openspec'
-  exit 1
+# Check for uncommitted/unstaged/untracked changes (excluding tooling dirs)
+DIRTY="$(git status --porcelain -- ':!.claude' ':!.pi' ':!openspec')"
+if [[ -n "$DIRTY" ]]; then
+  if [[ "$FORCE" == true ]]; then
+    echo "⚠️  Working tree is dirty (--force: continuing anyway)"
+    echo "$DIRTY" | sed 's/^/   /'
+    echo ""
+  else
+    echo "Error: working tree has uncommitted/unstaged/untracked changes:"
+    echo "$DIRTY" | sed 's/^/   /'
+    echo ""
+    echo "Commit or stash changes before releasing."
+    echo "Use --force to skip this check: ./release.sh --force $BUMP_TYPE"
+    exit 1
+  fi
+fi
+
+# Push any unpushed local commits first
+UNPUSHED=$(git log origin/main..HEAD --oneline 2>/dev/null || true)
+if [[ -n "$UNPUSHED" ]]; then
+  echo "Pushing unpushed commits first:"
+  echo "$UNPUSHED" | sed 's/^/   /'
+  echo ""
+  git push origin main
 fi
 
 # Read current version from package.json

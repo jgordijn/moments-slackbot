@@ -138,17 +138,19 @@ bun run dev          # watches for changes
 Use the `release.sh` script to create a new release. **Do not tag manually.**
 
 ```bash
-./release.sh patch   # Bug fixes, minor tweaks (0.4.0 → 0.4.1)
-./release.sh minor   # New features, behavioral changes (0.4.0 → 0.5.0)
-./release.sh major   # Breaking changes (0.4.0 → 1.0.0) — only when explicitly requested
+./release.sh patch          # Bug fixes, minor tweaks (0.5.0 → 0.5.1)
+./release.sh minor          # New features, behavioral changes (0.5.0 → 0.6.0)
+./release.sh major          # Breaking changes (0.5.0 → 1.0.0) — only when explicitly requested
+./release.sh --force patch  # Skip dirty working tree check
 ```
 
 The script:
-1. Validates you're on `main` with a clean working tree
-2. Bumps the version in `package.json`
-3. Commits with message "Release vX.Y.Z"
-4. Creates an annotated tag `vX.Y.Z`
-5. Pushes both the commit and the tag
+1. Validates you're on `main` with a clean working tree (halts if dirty; use `--force` to skip)
+2. Pushes any unpushed local commits first
+3. Bumps the version in `package.json`
+4. Commits with message "Release vX.Y.Z"
+5. Creates an annotated tag `vX.Y.Z`
+6. Pushes both the commit and the tag
 
 The tag push triggers GitHub Actions which packages and publishes the release.
 
