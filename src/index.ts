@@ -3,6 +3,7 @@
  */
 
 import { app } from "./bot";
+import { version } from "../package.json";
 
 // ---------------------------------------------------------------------------
 // Add timestamps to all log output
@@ -30,7 +31,7 @@ console.warn = (...args: any[]) => origWarn(`[${timestamp()}]`, ...args);
 
 async function main() {
   await app.start();
-  console.log("⚡ Moments Bot is running!");
+  console.log(`⚡ Moments Bot v${version} is running!`);
   console.log(`   Timezone: Europe/Amsterdam`);
   console.log(`   Mode: Socket Mode (private, DM only)`);
 }
