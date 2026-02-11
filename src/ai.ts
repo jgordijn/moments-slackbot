@@ -36,30 +36,28 @@ export interface ClassifyResult {
 const CLASSIFY_SYSTEM_PROMPT = `You classify messages sent to a personal microblog bot called "Moments".
 
 The bot publishes short thoughts to a website. Users send it text and it posts it.
+The bot can also edit existing moments: fix text, replace images, add sentences, etc.
 
 Your job: determine if the message is:
 1. **moment** — content the user wants to publish (a thought, discovery, observation, link, quote)
-2. **instruction** — a command or request TO the bot (edit something, delete something, change settings, replace an image, etc.)
+2. **instruction** — a command or request TO the bot (edit something, fix a typo, replace an image, add a sentence, delete an entry, etc.)
 3. **unclear** — genuinely ambiguous, could be either
 
 Guidelines:
 - Most messages are moments. Default to "moment" when in doubt.
-- Instructions typically address the bot directly: "can you...", "please change...", "replace the...", "delete...", "edit the previous...", "undo..."
+- Instructions typically address the bot directly: "can you...", "please change...", "replace the...", "delete...", "edit the previous...", "fix the typo...", "add a link to...", "undo..."
 - A message like "I love this new tool" is a moment. A message like "Can you fix the typo in my last post?" is an instruction.
 - Questions about what the bot can do are instructions.
 - If the message references a previous post and asks for changes, it's an instruction.
 - Only use "unclear" when it's genuinely 50/50 — not as a safe default.
 
-If the intent is "instruction", write a helpful response explaining what you can and can't do.
-The bot CAN: publish new moments, help craft moments, show today's entries.
-The bot CANNOT: edit previous posts, delete entries, replace images in existing posts, search old posts.
-For things the bot can't do, suggest the user edit the file directly on GitHub.
+For "instruction" intent, the response field can be empty — the bot will handle execution.
 
 Respond ONLY with valid JSON:
 {
   "intent": "moment" | "instruction" | "unclear",
   "reason": "brief explanation",
-  "response": "helpful response to user (only needed for instruction/unclear, empty string for moment)"
+  "response": ""
 }`;
 
 export async function classifyIntent(userText: string): Promise<ClassifyResult> {
@@ -139,6 +137,97 @@ export async function reviewMoment(userText: string): Promise<ReviewResult> {
   // Validate structure
   if (!["publish", "suggest"].includes(parsed.action)) {
     throw new Error(`Invalid action: ${parsed.action}`);
+  }
+
+  return parsed;
+}
+
+// ---------------------------------------------------------------------------
+// Instruction execution — edit existing moments
+// ---------------------------------------------------------------------------
+
+export interface InstructionResult {
+  /** "edit" = a specific edit to a moment, "unclear" = need clarification, "unsupported" = can't do this */
+  action: "edit" | "unclear" | "unsupported";
+  /** The date slug of the file being edited (e.g., "2026-02-11") */
+  dateSlug: string;
+  /** The full updated file content (complete file, not just the changed entry) */
+  updatedContent: string;
+  /** Human-readable summary of what was changed */
+  explanation: string;
+  /** If action is "unclear", a question to ask the user for clarification */
+  clarification: string;
+  /** If action is "unsupported", explain why */
+  unsupportedReason: string;
+  /** Warning if the edit targets a file more than 2 days old */
+  warning: string;
+}
+
+const INSTRUCTION_SYSTEM_PROMPT = `You are a writing assistant for a personal microblog called "Moments".
+The user wants to edit an existing moment. You will receive their instruction and the recent moment files.
+
+Moment files are markdown files with YAML frontmatter, one file per day. Entries within a day are separated by "---" (horizontal rule).
+
+Your job:
+1. Identify which moment file and which entry the user is referring to.
+2. Apply the requested change (fix text, replace an image reference, add a sentence, etc.).
+3. Return the COMPLETE updated file content (not just the changed part).
+
+Guidelines:
+- Preserve the YAML frontmatter exactly.
+- Preserve all entries you're NOT modifying exactly as they are.
+- Preserve the "---" separators between entries exactly.
+- If the user wants to replace an image and provides a new image path (via NEW_IMAGE_PATH), use that path.
+- If the instruction is ambiguous about WHICH entry to edit, return action "unclear" with a clarification question.
+- If the edit targets a file more than 2 days old, set a warning like "This edit targets a moment from {date}, which is X days ago. Are you sure?"
+- If the instruction asks for something you can't do (delete the entire file, change dates, etc.), return action "unsupported".
+- Keep the author's voice — don't rewrite things they didn't ask you to change.
+
+Respond ONLY with valid JSON matching this schema:
+{
+  "action": "edit" | "unclear" | "unsupported",
+  "dateSlug": "YYYY-MM-DD of the file being edited (empty if unclear/unsupported)",
+  "updatedContent": "the full updated file content (empty if unclear/unsupported)",
+  "explanation": "human-readable summary of the change",
+  "clarification": "question for the user (only if action is unclear)",
+  "unsupportedReason": "why this can't be done (only if action is unsupported)",
+  "warning": "warning message if editing old content (empty if none)"
+}`;
+
+export async function executeInstruction(
+  userInstruction: string,
+  recentMoments: { dateSlug: string; content: string }[],
+  newImagePath?: string,
+): Promise<InstructionResult> {
+  // Build the context with recent moment files
+  const momentsContext = recentMoments
+    .map((m) => `=== File: ${m.dateSlug}.md ===\n${m.content}`)
+    .join("\n\n");
+
+  let userMessage = `Instruction: ${userInstruction}\n\nRecent moment files:\n\n${momentsContext}`;
+
+  if (newImagePath) {
+    userMessage += `\n\nNEW_IMAGE_PATH: ${newImagePath}`;
+  }
+
+  const response = await openai.chat.completions.create({
+    model: config.aiModel,
+    temperature: 0.2,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: INSTRUCTION_SYSTEM_PROMPT },
+      { role: "user", content: userMessage },
+    ],
+  });
+
+  const rawContent = response.choices[0]?.message?.content;
+  if (!rawContent) throw new Error("Empty AI response for instruction");
+
+  const content = rawContent.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
+  const parsed = JSON.parse(content) as InstructionResult;
+
+  if (!["edit", "unclear", "unsupported"].includes(parsed.action)) {
+    throw new Error(`Invalid instruction action: ${parsed.action}`);
   }
 
   return parsed;

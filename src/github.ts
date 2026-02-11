@@ -134,3 +134,59 @@ export async function getTodayEntries(dateSlug?: string): Promise<string | null>
   const file = await getFile(slug);
   return file?.content || null;
 }
+
+/** Date slug for N days ago in Europe/Amsterdam timezone. */
+function dateSlugDaysAgo(daysAgo: number): string {
+  const date = new Date();
+  date.setDate(date.getDate() - daysAgo);
+  return date.toLocaleDateString("en-CA", { timeZone: "Europe/Amsterdam" }).slice(0, 10);
+}
+
+export interface MomentFile {
+  dateSlug: string;
+  content: string;
+  sha: string;
+}
+
+/**
+ * Read recent moment files (today + up to `days` days back).
+ * Returns files that exist, most recent first.
+ */
+export async function getRecentMoments(days: number = 3): Promise<MomentFile[]> {
+  const results: MomentFile[] = [];
+
+  for (let i = 0; i <= days; i++) {
+    const slug = dateSlugDaysAgo(i);
+    const file = await getFile(slug);
+    if (file) {
+      results.push({ dateSlug: slug, content: file.content, sha: file.sha });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Update an existing moment file with new content.
+ * Requires the SHA of the current version to prevent conflicts.
+ */
+export async function updateMomentFile(
+  dateSlug: string,
+  newContent: string,
+  sha: string,
+  commitMessage: string,
+): Promise<string> {
+  const path = filePath(dateSlug);
+
+  await octokit.repos.createOrUpdateFileContents({
+    owner,
+    repo,
+    path,
+    message: commitMessage,
+    content: Buffer.from(newContent, "utf-8").toString("base64"),
+    sha,
+    branch: "main",
+  });
+
+  return `https://github.com/${owner}/${repo}/blob/main/${path}`;
+}

@@ -10,8 +10,8 @@
 
 import { App, BlockAction, ButtonAction } from "@slack/bolt";
 import { config } from "./config";
-import { reviewMoment, craftMoment, classifyIntent } from "./ai";
-import { addMoment, getTodayEntries, todaySlug, uploadImage } from "./github";
+import { reviewMoment, craftMoment, classifyIntent, executeInstruction } from "./ai";
+import { addMoment, getTodayEntries, todaySlug, uploadImage, getRecentMoments, updateMomentFile, type MomentFile } from "./github";
 import { convertSlackEmoji } from "./slack-emoji";
 import { extractImageFiles, processMessageImages, type ProcessedImage } from "./images";
 
@@ -35,6 +35,15 @@ interface PendingUnclear {
   message: any;
 }
 const pendingUnclear = new Map<string, PendingUnclear>();
+
+// Store for pending edits awaiting user approval
+interface PendingEdit {
+  dateSlug: string;
+  updatedContent: string;
+  sha: string;
+  explanation: string;
+}
+const pendingEdits = new Map<string, PendingEdit>();
 
 /** Guard: only allow the authorized user. */
 function isAuthorized(userId: string): boolean {
@@ -181,14 +190,80 @@ app.action<BlockAction<ButtonAction>>("treat_as_instruction", async ({ ack, body
   const userId = body.user.id;
   if (!isAuthorized(userId)) return;
 
+  const pending = pendingUnclear.get(userId);
   pendingUnclear.delete(userId);
+
+  if (!pending) {
+    await client.chat.postMessage({
+      channel: body.channel?.id || userId,
+      text: "⚠️ Couldn't find the original message. Please send it again.",
+    });
+    return;
+  }
+
+  const sayViaClient = async (msg: any) => {
+    const channel = body.channel?.id || userId;
+    if (typeof msg === "string") {
+      await client.chat.postMessage({ channel, text: msg });
+    } else {
+      await client.chat.postMessage({ channel, ...msg });
+    }
+  };
+
+  await handleInstruction(pending.text, pending.message, sayViaClient);
+});
+
+app.action<BlockAction<ButtonAction>>("approve_edit", async ({ ack, body, client }) => {
+  await ack();
+
+  const userId = body.user.id;
+  if (!isAuthorized(userId)) return;
+
+  const edit = pendingEdits.get(userId);
+  if (!edit) {
+    await client.chat.postMessage({
+      channel: body.channel?.id || userId,
+      text: "⚠️ No pending edit found. Send a new instruction!",
+    });
+    return;
+  }
+
+  pendingEdits.delete(userId);
+
+  try {
+    console.log(`[github] applying edit to ${edit.dateSlug}...`);
+    const start = Date.now();
+    const url = await updateMomentFile(
+      edit.dateSlug,
+      edit.updatedContent,
+      edit.sha,
+      `Edit moment for ${edit.dateSlug}`,
+    );
+    console.log(`[github] edit applied in ${Date.now() - start}ms`);
+
+    await client.chat.postMessage({
+      channel: body.channel?.id || userId,
+      text: `✅ Edit applied to ${edit.dateSlug}!\n\n${edit.explanation}\n\n🔗 ${url}`,
+    });
+  } catch (err: any) {
+    console.error("Error applying edit:", err);
+    await client.chat.postMessage({
+      channel: body.channel?.id || userId,
+      text: `❌ Failed to apply edit: ${err.message}`,
+    });
+  }
+});
+
+app.action<BlockAction<ButtonAction>>("reject_edit", async ({ ack, body, client }) => {
+  await ack();
+
+  const userId = body.user.id;
+  if (!isAuthorized(userId)) return;
+
+  pendingEdits.delete(userId);
   await client.chat.postMessage({
     channel: body.channel?.id || userId,
-    text: "💬 Got it! I can't do that directly, but here's what I can help with:\n\n" +
-      "• *Send any text* → I'll review and publish it as a moment\n" +
-      "• *help me write about <topic>* → I'll craft a moment for you\n" +
-      "• *show today* → see today's entries\n\n" +
-      "To edit or delete existing moments, you'll need to edit the file directly on GitHub.",
+    text: "👍 Edit discarded. Let me know if you'd like to try something else.",
   });
 });
 
@@ -252,7 +327,7 @@ async function handleNewMoment(text: string, message: any, say: Function) {
     console.log(`[ai] classified in ${Date.now() - start}ms — intent=${classification.intent}`);
 
     if (classification.intent === "instruction") {
-      await say(`💬 ${classification.response}`);
+      await handleInstruction(text, message, say);
       return;
     }
 
@@ -365,6 +440,121 @@ async function processAsMoment(text: string, message: any, hasImages: boolean, s
     }
   } catch (err: any) {
     console.error("Error processing moment:", err);
+    await say(`❌ Something went wrong: ${err.message}`);
+  }
+}
+
+/** Handle an instruction to edit existing moments. */
+async function handleInstruction(text: string, message: any, say: Function) {
+  await say("🔧 Working on your request...");
+
+  try {
+    // If the message has images, upload them first (for image replacement)
+    const hasImages = "files" in message && extractImageFiles(message).length > 0;
+    let newImagePath: string | undefined;
+
+    if (hasImages) {
+      console.log(`[images] instruction includes image(s), uploading...`);
+      const embeds = await processAndUploadImages(message);
+      if (embeds.length > 0) {
+        // Extract the path from the markdown embed: ![image](/images/moments/...) → /images/moments/...
+        const match = embeds[0].match(/\!\[.*?\]\((.*?)\)/);
+        newImagePath = match ? match[1] : undefined;
+        console.log(`[images] new image path for instruction: ${newImagePath}`);
+      }
+    }
+
+    // Fetch recent moments for context
+    console.log(`[github] fetching recent moments...`);
+    const recentMoments = await getRecentMoments(5);
+
+    if (recentMoments.length === 0) {
+      await say("📭 No recent moments found to edit. Send me a new moment instead!");
+      return;
+    }
+
+    console.log(`[github] found ${recentMoments.length} recent file(s): ${recentMoments.map(m => m.dateSlug).join(", ")}`);
+
+    // Ask AI to execute the instruction
+    console.log(`[ai] executing instruction...`);
+    const start = Date.now();
+    const result = await executeInstruction(
+      text,
+      recentMoments.map(m => ({ dateSlug: m.dateSlug, content: m.content })),
+      newImagePath,
+    );
+    console.log(`[ai] instruction done in ${Date.now() - start}ms — action=${result.action}`);
+
+    if (result.action === "unsupported") {
+      await say(`😔 ${result.unsupportedReason}`);
+      return;
+    }
+
+    if (result.action === "unclear") {
+      await say(`🤔 ${result.clarification}`);
+      return;
+    }
+
+    // action === "edit" — propose the change
+    const targetFile = recentMoments.find(m => m.dateSlug === result.dateSlug);
+    if (!targetFile) {
+      await say(`⚠️ Couldn't find the moment file for ${result.dateSlug}. Something went wrong.`);
+      return;
+    }
+
+    // Store the pending edit
+    pendingEdits.set(config.authorizedUserId, {
+      dateSlug: result.dateSlug,
+      updatedContent: result.updatedContent,
+      sha: targetFile.sha,
+      explanation: result.explanation,
+    });
+
+    const blocks: any[] = [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `✏️ *Proposed edit to ${result.dateSlug}:*\n\n${result.explanation}`,
+        },
+      },
+    ];
+
+    // Show a warning if editing old content
+    if (result.warning) {
+      blocks.push({
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `⚠️ ${result.warning}`,
+        },
+      });
+    }
+
+    blocks.push({
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "✅ Apply edit", emoji: true },
+          style: "primary",
+          action_id: "approve_edit",
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "❌ Discard", emoji: true },
+          style: "danger",
+          action_id: "reject_edit",
+        },
+      ],
+    });
+
+    await say({
+      text: `Proposed edit to ${result.dateSlug}`,
+      blocks,
+    });
+  } catch (err: any) {
+    console.error("Error handling instruction:", err);
     await say(`❌ Something went wrong: ${err.message}`);
   }
 }
