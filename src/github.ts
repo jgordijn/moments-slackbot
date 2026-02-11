@@ -91,6 +91,43 @@ export async function addMoment(text: string, dateSlug?: string): Promise<{ crea
   return { created: !existing, url };
 }
 
+/**
+ * Upload an image to the repository's images directory.
+ * Returns the markdown-ready URL path (e.g., "/images/moments/2026-02-11-084037-1.png").
+ */
+export async function uploadImage(imageBuffer: Buffer, filename: string): Promise<string> {
+  const path = `${config.momentsImagesPath}/${filename}`;
+
+  // Check if the file already exists (to get SHA for update)
+  let sha: string | undefined;
+  try {
+    const { data } = await octokit.repos.getContent({ owner, repo, path, ref: "main" });
+    if ("sha" in data) {
+      sha = (data as any).sha;
+    }
+  } catch (err: any) {
+    if (err.status !== 404) throw err;
+    // 404 = file doesn't exist yet, which is expected
+  }
+
+  const params: any = {
+    owner,
+    repo,
+    path,
+    message: `Add moment image ${filename}`,
+    content: imageBuffer.toString("base64"),
+    branch: "main",
+  };
+
+  if (sha) {
+    params.sha = sha;
+  }
+
+  await octokit.repos.createOrUpdateFileContents(params);
+
+  return `${config.momentsImagesUrlPrefix}/${filename}`;
+}
+
 /** Read all entries from today's file (for context). */
 export async function getTodayEntries(dateSlug?: string): Promise<string | null> {
   const slug = dateSlug || todaySlug();

@@ -14,6 +14,8 @@ A private Slack bot that publishes short thoughts and discoveries to your [Momen
 | What you type | What happens |
 |---|---|
 | Any text | Reviews and publishes (or suggests edits) |
+| Text + image(s) | Reviews text, uploads image(s), publishes with embedded images |
+| Image only | Uploads image and publishes as an image moment |
 | `help me write about <topic>` | AI crafts a polished moment for you |
 | `show today` | Shows today's published moments |
 | `help` | Shows available commands |
@@ -40,6 +42,7 @@ A private Slack bot that publishes short thoughts and discoveries to your [Momen
 #### Bot Token Scopes
 Go to **OAuth & Permissions** → **Bot Token Scopes** and add:
 - `chat:write` — send messages
+- `files:read` — download image attachments from messages
 - `im:history` — read DM messages
 - `im:read` — access DM channel info
 - `im:write` — open DMs
@@ -115,6 +118,7 @@ oauth_config:
   scopes:
     bot:
       - chat:write
+      - files:read
       - im:history
       - im:read
       - im:write
@@ -139,9 +143,27 @@ Moments Bot (Socket Mode — outbound only)
     │   ├── Minor fixes → publish directly
     │   └── Bigger changes → propose with buttons
     └── GitHub API
+        ├── Images → public/images/moments/ (referenced as /images/moments/...)
         └── Commit to main → content/moments/YYYY-MM-DD.md
             → Website rebuilds automatically
 ```
+
+## Image Support
+
+The bot handles image attachments in Slack messages:
+
+- **Text + image(s)**: AI reviews the text, images are uploaded to `public/images/moments/` in the repo, and the published moment includes both text and `![image](/images/moments/...)` embeds.
+- **Image only**: No AI review; the moment is published with just the image embed.
+- **Multiple images**: All images are uploaded and embedded in a single moment entry.
+
+Images follow the same convention as blog posts on the website: stored in `public/images/` and referenced as `/images/...` in markdown (the `public` prefix is dropped because Next.js serves it as the site root).
+
+### Image Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MOMENTS_IMAGES_PATH` | `public/images/moments` | Path in the repo where moment images are stored |
+| `MOMENTS_IMAGES_URL_PREFIX` | `/images/moments` | URL prefix used in markdown image embeds (no `public` — Next.js serves `public/` as site root) |
 
 ## Name suggestions for Slack
 

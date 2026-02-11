@@ -33,6 +33,12 @@ export const config = {
   /** Path inside the repo where moment files live */
   momentsPath: process.env.MOMENTS_PATH || "content/moments",
 
+  /** Path inside the repo where moment images are stored */
+  momentsImagesPath: process.env.MOMENTS_IMAGES_PATH || "public/images/moments",
+
+  /** URL prefix for image embeds in markdown (no "public" — Next.js serves public/ as site root) */
+  momentsImagesUrlPrefix: process.env.MOMENTS_IMAGES_URL_PREFIX || "/images/moments",
+
   /** OpenRouter API key for AI features */
   openrouterApiKey: requireEnv("OPENROUTER_API_KEY"),
 

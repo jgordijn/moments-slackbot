@@ -11,8 +11,9 @@
 import { App, BlockAction, ButtonAction } from "@slack/bolt";
 import { config } from "./config";
 import { reviewMoment, craftMoment } from "./ai";
-import { addMoment, getTodayEntries, todaySlug } from "./github";
+import { addMoment, getTodayEntries, todaySlug, uploadImage } from "./github";
 import { convertSlackEmoji } from "./slack-emoji";
+import { extractImageFiles, processMessageImages, type ProcessedImage } from "./images";
 
 export const app = new App({
   token: config.slackBotToken,
@@ -21,7 +22,12 @@ export const app = new App({
 });
 
 // In-memory store of pending proposals per user (there's only one user, but still clean)
-const pendingProposals = new Map<string, string>();
+interface PendingProposal {
+  text: string;
+  /** Markdown embed strings for uploaded images (already on GitHub) */
+  imageEmbeds: string[];
+}
+const pendingProposals = new Map<string, PendingProposal>();
 
 /** Guard: only allow the authorized user. */
 function isAuthorized(userId: string): boolean {
@@ -41,10 +47,16 @@ app.message(async ({ message, say }) => {
   // Allow "file_share" subtype — these are messages with image attachments
   // that still contain text (e.g. "Image from iOS").
   if (message.subtype && message.subtype !== "file_share") return;
-  if (!("text" in message) || !message.text) return;
 
-  const userId = message.user;
-  console.log(`[message] from=${userId} text="${("text" in message && message.text) ? message.text.slice(0, 50) : ""}..."`);
+  const hasText = "text" in message && !!message.text;
+  const hasImages = "files" in message && extractImageFiles(message).length > 0;
+
+  // Need at least text or images to proceed
+  if (!hasText && !hasImages) return;
+
+  const userId = (message as any).user;
+  const textPreview = hasText ? (message as any).text.slice(0, 50) : "(no text)";
+  console.log(`[message] from=${userId} text="${textPreview}..." images=${hasImages}`);
 
   if (!userId || !isAuthorized(userId)) {
     console.log(`[auth] rejected user=${userId}`);
@@ -52,16 +64,16 @@ app.message(async ({ message, say }) => {
     return;
   }
 
-  const text = message.text.trim();
+  const text = hasText ? (message as any).text.trim() : "";
 
-  // --- Command: show today's entries ---
-  if (/^(show\s+today|today|what.?s\s+today)/i.test(text)) {
+  // --- Command: show today's entries (text-only commands) ---
+  if (text && /^(show\s+today|today|what.?s\s+today)/i.test(text)) {
     await handleShowToday(say);
     return;
   }
 
   // --- Command: help me write / craft ---
-  if (/^(help\s+me\s+(write|craft|post)|make\s+(this\s+)?a?\s*(nice\s+)?post)/i.test(text)) {
+  if (text && /^(help\s+me\s+(write|craft|post)|make\s+(this\s+)?a?\s*(nice\s+)?post)/i.test(text)) {
     const idea = text.replace(/^(help\s+me\s+(write|craft|post)\s*(about)?|make\s+(this\s+)?a?\s*(nice\s+)?post\s*(about|of)?)\s*/i, "").trim();
     if (!idea) {
       await say("💡 Tell me what you'd like to write about! e.g.\n> help me write about discovering a cool new tool");
@@ -72,11 +84,12 @@ app.message(async ({ message, say }) => {
   }
 
   // --- Command: help ---
-  if (/^help$/i.test(text)) {
+  if (text && /^help$/i.test(text)) {
     await say(
       "👋 *Moments Bot* — your private microblog assistant\n\n" +
       "Just send me a thought and I'll post it to your moments page.\n\n" +
       "• *Send any text* → I'll review it and publish (or suggest edits)\n" +
+      "• *Send an image* (with or without text) → I'll include it in your moment\n" +
       "• *help me write about <topic>* → I'll craft a nice moment for you\n" +
       "• *show today* → see what's been posted today\n" +
       "• *help* → this message"
@@ -84,8 +97,8 @@ app.message(async ({ message, say }) => {
     return;
   }
 
-  // --- Default: treat as a new moment ---
-  await handleNewMoment(convertSlackEmoji(text), say);
+  // --- Default: treat as a new moment (with optional images) ---
+  await handleNewMoment(text ? convertSlackEmoji(text) : "", message, say);
 });
 
 // ---------------------------------------------------------------------------
@@ -97,8 +110,8 @@ app.action<BlockAction<ButtonAction>>("accept_suggestion", async ({ ack, body, c
   const userId = body.user.id;
   if (!isAuthorized(userId)) return;
 
-  const proposed = pendingProposals.get(userId);
-  if (!proposed) {
+  const proposal = pendingProposals.get(userId);
+  if (!proposal) {
     await client.chat.postMessage({
       channel: body.channel?.id || userId,
       text: "⚠️ No pending proposal found. Send a new moment!",
@@ -107,7 +120,8 @@ app.action<BlockAction<ButtonAction>>("accept_suggestion", async ({ ack, body, c
   }
 
   pendingProposals.delete(userId);
-  await publishAndConfirm(proposed, body.channel?.id || userId, client);
+  const fullText = combineTextAndImages(proposal.text, proposal.imageEmbeds);
+  await publishAndConfirm(fullText, body.channel?.id || userId, client);
 });
 
 app.action<BlockAction<ButtonAction>>("reject_suggestion", async ({ ack, body, client }) => {
@@ -141,34 +155,113 @@ app.action<BlockAction<ButtonAction>>("publish_original", async ({ ack, body, cl
     return;
   }
 
+  // Get image embeds from the pending proposal (images are already uploaded)
+  const proposal = pendingProposals.get(userId);
+  const imageEmbeds = proposal?.imageEmbeds || [];
+
   pendingProposals.delete(userId);
-  await publishAndConfirm(convertSlackEmoji(originalText), body.channel?.id || userId, client);
+  const fullText = combineTextAndImages(convertSlackEmoji(originalText), imageEmbeds);
+  await publishAndConfirm(fullText, body.channel?.id || userId, client);
 });
 
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
-async function handleNewMoment(text: string, say: Function) {
-  await say("🔍 Reviewing your moment...");
+async function handleNewMoment(text: string, message: any, say: Function) {
+  const hasImages = "files" in message && extractImageFiles(message).length > 0;
+  const hasText = text.length > 0;
+
+  if (hasImages && hasText) {
+    await say("🔍 Reviewing your moment and processing image(s)...");
+  } else if (hasImages) {
+    await say("🔍 Processing your image(s)...");
+  } else {
+    await say("🔍 Reviewing your moment...");
+  }
 
   try {
-    console.log(`[ai] reviewing moment...`);
-    const start = Date.now();
-    const review = await reviewMoment(text);
-    console.log(`[ai] review done in ${Date.now() - start}ms — action=${review.action}`);
+    // Process images and AI review in parallel
+    const imagePromise = hasImages
+      ? processAndUploadImages(message)
+      : Promise.resolve([] as string[]);
 
-    if (review.action === "publish") {
-      // Minor fixes only — publish directly
-      await publishAndNotify(review.text, say);
+    const reviewPromise = hasText
+      ? (async () => {
+          console.log(`[ai] reviewing moment...`);
+          const start = Date.now();
+          const review = await reviewMoment(text);
+          console.log(`[ai] review done in ${Date.now() - start}ms — action=${review.action}`);
+          return review;
+        })()
+      : Promise.resolve(null);
+
+    const [imageEmbeds, review] = await Promise.all([imagePromise, reviewPromise]);
+
+    // Check if all images failed
+    if (hasImages && imageEmbeds.length === 0) {
+      if (hasText) {
+        // Publish text-only and warn about images
+        console.warn(`[images] all images failed, publishing text only`);
+        if (review && review.action === "publish") {
+          await publishAndNotify(review.text, say);
+          await say("⚠️ Couldn't include the image(s), but your text was published.");
+        } else if (review) {
+          await proposeSuggestion(text, review.text, review.explanation, [], say);
+          await say("⚠️ Couldn't process the image(s). They won't be included.");
+        }
+      } else {
+        await say("❌ Couldn't process the image(s). Please try again.");
+      }
+      return;
+    }
+
+    // Image-only moment (no text, no AI review)
+    if (!hasText) {
+      const fullText = imageEmbeds.join("\n\n");
+      await publishAndNotify(fullText, say);
+      return;
+    }
+
+    // Text + optional images
+    if (review!.action === "publish") {
+      const fullText = combineTextAndImages(review!.text, imageEmbeds);
+      await publishAndNotify(fullText, say);
     } else {
-      // Bigger changes suggested — ask the user
-      await proposeSuggestion(text, review.text, review.explanation, say);
+      await proposeSuggestion(text, review!.text, review!.explanation, imageEmbeds, say);
     }
   } catch (err: any) {
-    console.error("Error reviewing moment:", err);
+    console.error("Error processing moment:", err);
     await say(`❌ Something went wrong: ${err.message}`);
   }
+}
+
+/** Process images from a message: download from Slack, upload to GitHub. Returns markdown embed strings. */
+async function processAndUploadImages(message: any): Promise<string[]> {
+  const slug = todaySlug();
+  const images = await processMessageImages(message, slug);
+  console.log(`[images] found ${images.length} image(s)`);
+
+  const embeds: string[] = [];
+  for (const img of images) {
+    try {
+      console.log(`[images] uploading ${img.filename}...`);
+      const start = Date.now();
+      await uploadImage(img.buffer, img.filename);
+      console.log(`[images] uploaded ${img.filename} in ${Date.now() - start}ms`);
+      embeds.push(img.markdownEmbed);
+    } catch (err: any) {
+      console.error(`[images] failed to upload ${img.filename}: ${err.message}`);
+    }
+  }
+  return embeds;
+}
+
+/** Combine text and image markdown embeds into a single moment entry. */
+function combineTextAndImages(text: string, imageEmbeds: string[]): string {
+  if (imageEmbeds.length === 0) return text;
+  if (!text) return imageEmbeds.join("\n\n");
+  return text + "\n\n" + imageEmbeds.join("\n\n");
 }
 
 async function handleCraft(idea: string, say: Function) {
@@ -233,10 +326,10 @@ async function publishAndConfirm(text: string, channel: string, client: any) {
   }
 }
 
-async function proposeSuggestion(original: string, suggested: string, explanation: string, say: Function) {
-  // Store the suggestion for the accept action
+async function proposeSuggestion(original: string, suggested: string, explanation: string, imageEmbeds: string[], say: Function) {
+  // Store the suggestion and image embeds for the accept/publish-original actions
   // We use the authorized user ID since there's only one user
-  pendingProposals.set(config.authorizedUserId, suggested);
+  pendingProposals.set(config.authorizedUserId, { text: suggested, imageEmbeds });
 
   await say({
     text: "I have a suggestion for your moment",
@@ -290,7 +383,7 @@ async function proposeSuggestion(original: string, suggested: string, explanatio
 }
 
 async function proposeCrafted(crafted: string, say: Function) {
-  pendingProposals.set(config.authorizedUserId, crafted);
+  pendingProposals.set(config.authorizedUserId, { text: crafted, imageEmbeds: [] });
 
   await say({
     text: "Here's a crafted moment for you",
