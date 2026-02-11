@@ -67,6 +67,8 @@ export async function downloadSlackFile(file: SlackFile): Promise<Buffer> {
   let url = file.url_private_download;
   const authHeader = `Bearer ${config.slackBotToken}`;
 
+  console.log(`[images] download: starting from ${url}`);
+
   // Follow redirects manually to preserve the Authorization header
   for (let redirects = 0; redirects < 5; redirects++) {
     const response = await fetch(url, {
@@ -74,12 +76,15 @@ export async function downloadSlackFile(file: SlackFile): Promise<Buffer> {
       redirect: "manual",
     });
 
+    console.log(`[images] download: ${url} → HTTP ${response.status} (content-type: ${response.headers.get("content-type") || "none"})`);
+
     // Handle redirects
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("location");
       if (!location) {
         throw new Error(`Redirect with no Location header for ${file.name}`);
       }
+      console.log(`[images] download: redirecting to ${location}`);
       url = location;
       continue;
     }
@@ -91,6 +96,9 @@ export async function downloadSlackFile(file: SlackFile): Promise<Buffer> {
     // Verify we got an actual image, not an HTML auth page
     const contentType = response.headers.get("content-type") || "";
     if (contentType.includes("text/html")) {
+      // Log the first 200 chars of the body for debugging
+      const body = await response.text();
+      console.error(`[images] download: got HTML instead of image. First 200 chars: ${body.slice(0, 200)}`);
       throw new Error(`Got HTML instead of image for ${file.name} — likely an auth issue`);
     }
 
