@@ -64,49 +64,32 @@ export function extractImageFiles(message: any): SlackFile[] {
  * Throws on non-200 response or if the response is not an image.
  */
 export async function downloadSlackFile(file: SlackFile): Promise<Buffer> {
-  let url = file.url_private_download;
-  const authHeader = `Bearer ${config.slackBotToken}`;
+  // Slack file downloads require authentication. The Authorization header
+  // approach doesn't always work because Slack redirects to the workspace
+  // login page. Using the token as a query parameter is more reliable.
+  const separator = file.url_private_download.includes("?") ? "&" : "?";
+  const url = `${file.url_private_download}${separator}t=${config.slackBotToken}`;
 
-  console.log(`[images] download: starting from ${url}`);
+  console.log(`[images] download: fetching ${file.url_private_download} (with token param)`);
 
-  // Follow redirects manually to preserve the Authorization header
-  for (let redirects = 0; redirects < 5; redirects++) {
-    const response = await fetch(url, {
-      headers: { Authorization: authHeader },
-      redirect: "manual",
-    });
+  const response = await fetch(url);
 
-    console.log(`[images] download: ${url} → HTTP ${response.status} (content-type: ${response.headers.get("content-type") || "none"})`);
+  console.log(`[images] download: HTTP ${response.status} (content-type: ${response.headers.get("content-type") || "none"})`);
 
-    // Handle redirects
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get("location");
-      if (!location) {
-        throw new Error(`Redirect with no Location header for ${file.name}`);
-      }
-      console.log(`[images] download: redirecting to ${location}`);
-      url = location;
-      continue;
-    }
-
-    if (!response.ok) {
-      throw new Error(`Failed to download ${file.name}: HTTP ${response.status}`);
-    }
-
-    // Verify we got an actual image, not an HTML auth page
-    const contentType = response.headers.get("content-type") || "";
-    if (contentType.includes("text/html")) {
-      // Log the first 200 chars of the body for debugging
-      const body = await response.text();
-      console.error(`[images] download: got HTML instead of image. First 200 chars: ${body.slice(0, 200)}`);
-      throw new Error(`Got HTML instead of image for ${file.name} — likely an auth issue`);
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    return Buffer.from(arrayBuffer);
+  if (!response.ok) {
+    throw new Error(`Failed to download ${file.name}: HTTP ${response.status}`);
   }
 
-  throw new Error(`Too many redirects downloading ${file.name}`);
+  // Verify we got an actual image, not an HTML auth page
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("text/html")) {
+    const body = await response.text();
+    console.error(`[images] download: got HTML instead of image. First 200 chars: ${body.slice(0, 200)}`);
+    throw new Error(`Got HTML instead of image for ${file.name} — check that the Slack app has the files:read scope`);
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  return Buffer.from(arrayBuffer);
 }
 
 /**
