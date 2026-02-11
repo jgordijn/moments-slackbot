@@ -69,32 +69,47 @@ export function extractImageFiles(message: any): SlackFile[] {
  * Throws on non-200 response or if the response is not an image.
  */
 export async function downloadSlackFile(file: SlackFile): Promise<Buffer> {
-  // Slack file downloads require authentication. The Authorization header
-  // approach doesn't always work because Slack redirects to the workspace
-  // login page. Using the token as a query parameter is more reliable.
-  const separator = file.url_private_download.includes("?") ? "&" : "?";
-  const url = `${file.url_private_download}${separator}t=${config.slackBotToken}`;
+  // Try multiple download strategies — Slack's file API is inconsistent
+  const strategies = [
+    // Strategy 1: url_private with Authorization header
+    { url: file.url_private_download.replace("/download/", "/"), method: "Bearer header (url_private)" },
+    // Strategy 2: url_private_download with Authorization header
+    { url: file.url_private_download, method: "Bearer header (url_private_download)" },
+    // Strategy 3: url_private with token query param
+    { url: `${file.url_private_download.replace("/download/", "/")}?t=${config.slackBotToken}`, method: "token param (url_private)" },
+    // Strategy 4: url_private_download with token query param
+    { url: `${file.url_private_download}?t=${config.slackBotToken}`, method: "token param (url_private_download)" },
+  ];
 
-  console.log(`[images] download: fetching ${file.url_private_download} (with token param)`);
+  for (const strategy of strategies) {
+    try {
+      const headers: Record<string, string> = {};
+      if (!strategy.url.includes("?t=")) {
+        headers["Authorization"] = `Bearer ${config.slackBotToken}`;
+      }
 
-  const response = await fetch(url);
+      console.log(`[images] download: trying ${strategy.method}`);
+      const response = await fetch(strategy.url, { headers, redirect: "follow" });
+      console.log(`[images] download: ${strategy.method} → HTTP ${response.status} (content-type: ${response.headers.get("content-type") || "none"})`);
 
-  console.log(`[images] download: HTTP ${response.status} (content-type: ${response.headers.get("content-type") || "none"})`);
+      if (!response.ok) continue;
 
-  if (!response.ok) {
-    throw new Error(`Failed to download ${file.name}: HTTP ${response.status}`);
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("text/html")) {
+        console.log(`[images] download: ${strategy.method} returned HTML, skipping`);
+        continue;
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      console.log(`[images] download: success with ${strategy.method} (${buffer.length} bytes)`);
+      return buffer;
+    } catch (err: any) {
+      console.log(`[images] download: ${strategy.method} failed: ${err.message}`);
+    }
   }
 
-  // Verify we got an actual image, not an HTML auth page
-  const contentType = response.headers.get("content-type") || "";
-  if (contentType.includes("text/html")) {
-    const body = await response.text();
-    console.error(`[images] download: got HTML instead of image. First 200 chars: ${body.slice(0, 200)}`);
-    throw new Error(`Got HTML instead of image for ${file.name} — check that the Slack app has the files:read scope`);
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  return Buffer.from(arrayBuffer);
+  throw new Error(`All download strategies failed for ${file.name} — check that the Slack app has the files:read scope`);
 }
 
 /**
