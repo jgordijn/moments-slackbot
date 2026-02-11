@@ -43,13 +43,18 @@ export function extractImageFiles(message: any): SlackFile[] {
   const files = message.files;
   if (!Array.isArray(files) || files.length === 0) return [];
 
+  // Log raw file objects for debugging
+  for (const f of files) {
+    console.log(`[images] raw file: id=${f.id} name=${f.name} mimetype=${f.mimetype} mode=${f.mode} url_private=${f.url_private} url_private_download=${f.url_private_download}`);
+  }
+
   return files
-    .filter((f: any) => f.mimetype && SUPPORTED_MIME_TYPES.has(f.mimetype) && f.url_private_download)
+    .filter((f: any) => f.mimetype && SUPPORTED_MIME_TYPES.has(f.mimetype) && (f.url_private_download || f.url_private))
     .map((f: any) => ({
       id: f.id,
       name: f.name || "image",
       mimetype: f.mimetype,
-      url_private_download: f.url_private_download,
+      url_private_download: f.url_private_download || f.url_private,
     }));
 }
 
