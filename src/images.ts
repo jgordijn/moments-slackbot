@@ -55,21 +55,50 @@ export function extractImageFiles(message: any): SlackFile[] {
 
 /**
  * Download a file from Slack using the bot token for authentication.
- * Throws on non-200 response.
+ *
+ * Slack's url_private_download can redirect across origins, which causes
+ * fetch() to strip the Authorization header on the redirect. To handle this,
+ * we disable automatic redirect following and manually follow redirects while
+ * preserving the auth header.
+ *
+ * Throws on non-200 response or if the response is not an image.
  */
 export async function downloadSlackFile(file: SlackFile): Promise<Buffer> {
-  const response = await fetch(file.url_private_download, {
-    headers: {
-      Authorization: `Bearer ${config.slackBotToken}`,
-    },
-  });
+  let url = file.url_private_download;
+  const authHeader = `Bearer ${config.slackBotToken}`;
 
-  if (!response.ok) {
-    throw new Error(`Failed to download ${file.name}: HTTP ${response.status}`);
+  // Follow redirects manually to preserve the Authorization header
+  for (let redirects = 0; redirects < 5; redirects++) {
+    const response = await fetch(url, {
+      headers: { Authorization: authHeader },
+      redirect: "manual",
+    });
+
+    // Handle redirects
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) {
+        throw new Error(`Redirect with no Location header for ${file.name}`);
+      }
+      url = location;
+      continue;
+    }
+
+    if (!response.ok) {
+      throw new Error(`Failed to download ${file.name}: HTTP ${response.status}`);
+    }
+
+    // Verify we got an actual image, not an HTML auth page
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("text/html")) {
+      throw new Error(`Got HTML instead of image for ${file.name} — likely an auth issue`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    return Buffer.from(arrayBuffer);
   }
 
-  const arrayBuffer = await response.arrayBuffer();
-  return Buffer.from(arrayBuffer);
+  throw new Error(`Too many redirects downloading ${file.name}`);
 }
 
 /**
