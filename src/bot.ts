@@ -45,6 +45,28 @@ interface PendingEdit {
 }
 const pendingEdits = new Map<string, PendingEdit>();
 
+// Conversation context for instruction follow-ups (clarification loops)
+interface ConversationContext {
+  originalInstruction: string;
+  originalMessage: any;
+  clarificationQuestion: string;
+  newImagePath?: string;
+  timestamp: number;
+}
+const conversationContext = new Map<string, ConversationContext>();
+
+/** Check if a message is likely a follow-up to a clarification question */
+function hasActiveConversation(userId: string): boolean {
+  const ctx = conversationContext.get(userId);
+  if (!ctx) return false;
+  // Expire after 5 minutes
+  if (Date.now() - ctx.timestamp > 5 * 60 * 1000) {
+    conversationContext.delete(userId);
+    return false;
+  }
+  return true;
+}
+
 /** Guard: only allow the authorized user. */
 function isAuthorized(userId: string): boolean {
   return userId === config.authorizedUserId;
@@ -110,6 +132,12 @@ app.message(async ({ message, say }) => {
       "• *show today* → see what's been posted today\n" +
       "• *help* → this message"
     );
+    return;
+  }
+
+  // --- Check for active conversation (follow-up to clarification) ---
+  if (text && hasActiveConversation(userId)) {
+    await handleFollowUp(userId, convertSlackEmoji(text), message, say);
     return;
   }
 
@@ -495,6 +523,14 @@ async function handleInstruction(text: string, message: any, say: Function) {
     }
 
     if (result.action === "unclear") {
+      // Store conversation context so the user's reply is understood as a follow-up
+      conversationContext.set(config.authorizedUserId, {
+        originalInstruction: text,
+        originalMessage: message,
+        clarificationQuestion: result.clarification,
+        newImagePath,
+        timestamp: Date.now(),
+      });
       await say(`🤔 ${result.clarification}`);
       return;
     }
@@ -559,6 +595,125 @@ async function handleInstruction(text: string, message: any, say: Function) {
     });
   } catch (err: any) {
     console.error("Error handling instruction:", err);
+    await say(`❌ Something went wrong: ${err.message}`);
+  }
+}
+
+/** Handle a follow-up message in an active clarification conversation. */
+async function handleFollowUp(userId: string, reply: string, message: any, say: Function) {
+  const ctx = conversationContext.get(userId)!;
+  conversationContext.delete(userId);
+
+  console.log(`[conversation] follow-up to: "${ctx.originalInstruction.slice(0, 50)}..." reply: "${reply.slice(0, 50)}..."`);
+
+  await say("🔧 Working on your request...");
+
+  try {
+    // Check if the follow-up message has new images
+    const hasImages = "files" in message && extractImageFiles(message).length > 0;
+    let newImagePath = ctx.newImagePath;
+
+    if (hasImages && !newImagePath) {
+      console.log(`[images] follow-up includes image(s), uploading...`);
+      const embeds = await processAndUploadImages(message);
+      if (embeds.length > 0) {
+        const match = embeds[0].match(/\!\[.*?\]\((.*?)\)/);
+        newImagePath = match ? match[1] : undefined;
+      }
+    }
+
+    // Fetch recent moments
+    const recentMoments = await getRecentMoments(5);
+    if (recentMoments.length === 0) {
+      await say("📭 No recent moments found to edit.");
+      return;
+    }
+
+    // Build a combined instruction with context
+    const combinedInstruction =
+      `Original request: ${ctx.originalInstruction}\n` +
+      `Bot asked: ${ctx.clarificationQuestion}\n` +
+      `User replied: ${reply}`;
+
+    console.log(`[ai] executing instruction with context...`);
+    const start = Date.now();
+    const result = await executeInstruction(
+      combinedInstruction,
+      recentMoments.map(m => ({ dateSlug: m.dateSlug, content: m.content })),
+      newImagePath,
+    );
+    console.log(`[ai] instruction done in ${Date.now() - start}ms — action=${result.action}`);
+
+    if (result.action === "unsupported") {
+      await say(`😔 ${result.unsupportedReason}`);
+      return;
+    }
+
+    if (result.action === "unclear") {
+      // Still unclear — store context again for another round
+      conversationContext.set(userId, {
+        originalInstruction: ctx.originalInstruction,
+        originalMessage: ctx.originalMessage,
+        clarificationQuestion: result.clarification,
+        newImagePath,
+        timestamp: Date.now(),
+      });
+      await say(`🤔 ${result.clarification}`);
+      return;
+    }
+
+    // action === "edit" — propose the change
+    const targetFile = recentMoments.find(m => m.dateSlug === result.dateSlug);
+    if (!targetFile) {
+      await say(`⚠️ Couldn't find the moment file for ${result.dateSlug}.`);
+      return;
+    }
+
+    pendingEdits.set(userId, {
+      dateSlug: result.dateSlug,
+      updatedContent: result.updatedContent,
+      sha: targetFile.sha,
+      explanation: result.explanation,
+    });
+
+    const blocks: any[] = [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `✏️ *Proposed edit to ${result.dateSlug}:*\n\n${result.explanation}`,
+        },
+      },
+    ];
+
+    if (result.warning) {
+      blocks.push({
+        type: "section",
+        text: { type: "mrkdwn", text: `⚠️ ${result.warning}` },
+      });
+    }
+
+    blocks.push({
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "✅ Apply edit", emoji: true },
+          style: "primary",
+          action_id: "approve_edit",
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "❌ Discard", emoji: true },
+          style: "danger",
+          action_id: "reject_edit",
+        },
+      ],
+    });
+
+    await say({ text: `Proposed edit to ${result.dateSlug}`, blocks });
+  } catch (err: any) {
+    console.error("Error handling follow-up:", err);
     await say(`❌ Something went wrong: ${err.message}`);
   }
 }
