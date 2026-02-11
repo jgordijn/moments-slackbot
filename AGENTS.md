@@ -57,17 +57,19 @@ Second moment, separated by a horizontal rule.
 
 ```
 src/
-├── index.ts         # Entry point — starts the Slack bot
+├── index.ts         # Entry point — starts the Slack bot, adds log timestamps
 ├── config.ts        # Environment variable loading and validation
 ├── bot.ts           # Slack message/action handlers, all bot logic and flows
 ├── ai.ts            # AI review and craft functions (OpenRouter via openai SDK)
-├── github.ts        # GitHub file read/create/append via Octokit
+├── github.ts        # GitHub file read/create/append/image upload via Octokit
+├── images.ts        # Slack image extraction, download, and processing
 └── slack-emoji.ts   # Converts Slack :emoji: shortcodes to Unicode
 ```
 
-- **`bot.ts`** is the largest file (~280 lines) and contains all Slack interaction logic: message routing, button handlers, proposal flows, and publishing.
+- **`bot.ts`** is the largest file and contains all Slack interaction logic: message routing, button handlers, proposal flows, image handling, and publishing.
 - **`ai.ts`** has two AI functions: `reviewMoment()` (structured JSON output with publish/suggest action) and `craftMoment()` (freeform text output).
-- **`github.ts`** handles reading existing day files and appending/creating moment entries with proper frontmatter.
+- **`github.ts`** handles reading existing day files, appending/creating moment entries with proper frontmatter, and uploading images to `public/images/moments/`.
+- **`images.ts`** extracts image files from Slack messages, downloads them via Slack API, and prepares them for GitHub upload.
 - **`slack-emoji.ts`** has a hardcoded map of ~200 common emoji shortcodes. Unknown ones pass through unchanged.
 
 ## Working With Microblog Entries
@@ -117,6 +119,8 @@ All configuration is via environment variables (see `.env.example`):
 | `GITHUB_REPO` | Yes | Repository name for the website |
 | `OPENROUTER_API_KEY` | Yes | OpenRouter API key |
 | `MOMENTS_PATH` | No | Path inside repo for moment files (default: `content/moments`) |
+| `MOMENTS_IMAGES_PATH` | No | Path in repo for moment images (default: `public/images/moments`) |
+| `MOMENTS_IMAGES_URL_PREFIX` | No | URL prefix in markdown embeds (default: `/images/moments`) |
 | `AI_MODEL` | No | OpenRouter model ID (default: `anthropic/claude-sonnet-4`) |
 
 ## Running Locally
@@ -129,8 +133,34 @@ bun run dev          # watches for changes
 # or: bun run start  # single run
 ```
 
+## Releasing
+
+Use the `release.sh` script to create a new release. **Do not tag manually.**
+
+```bash
+./release.sh patch   # Bug fixes, minor tweaks (0.4.0 → 0.4.1)
+./release.sh minor   # New features, behavioral changes (0.4.0 → 0.5.0)
+./release.sh major   # Breaking changes (0.4.0 → 1.0.0) — only when explicitly requested
+```
+
+The script:
+1. Validates you're on `main` with a clean working tree
+2. Bumps the version in `package.json`
+3. Commits with message "Release vX.Y.Z"
+4. Creates an annotated tag `vX.Y.Z`
+5. Pushes both the commit and the tag
+
+The tag push triggers GitHub Actions which packages and publishes the release.
+
+**When choosing the bump type:**
+- **patch**: Typo fixes, config changes, minor bug fixes, logging improvements
+- **minor**: New features, new integrations, behavioral changes
+- **major**: Only when explicitly sure — breaking changes, major rewrites
+
+If it's unclear whether a change is minor or patch, **ask the user** before releasing.
+
 ## Deployment
 
 - **Docker**: `docker compose up -d` — builds from `Dockerfile` (Bun Alpine image, non-root user, read-only filesystem, 256MB memory limit)
 - **Proxmox LXC**: See `docs/proxmox-setup.md` — Alpine container with OpenRC service, deployed via GitHub releases
-- **Updating**: Tag a version (`git tag v1.x.x && git push --tags`) → GitHub Actions creates a release → on the server, run `./update.sh`
+- **Updating**: After a release, run `./update.sh` on the server to pull the latest version
