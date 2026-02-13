@@ -20,6 +20,49 @@ export interface ReviewResult {
   explanation: string;
 }
 
+function parseJsonResponse<T>(rawContent: string, context: string): T {
+  const trimmed = rawContent.trim();
+  const candidates: string[] = [];
+
+  const pushCandidate = (value?: string) => {
+    if (!value) return;
+    const candidate = value.trim();
+    if (!candidate) return;
+    if (!candidates.includes(candidate)) candidates.push(candidate);
+  };
+
+  // Try the raw response first.
+  pushCandidate(trimmed);
+
+  // Common case: single fenced JSON block.
+  pushCandidate(trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, ""));
+
+  // Sometimes the model wraps JSON in additional text/fences — extract all fenced blocks.
+  const fencedBlocks = trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi);
+  for (const match of fencedBlocks) {
+    pushCandidate(match[1]);
+  }
+
+  // Last resort: grab everything between the first "{" and last "}".
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    pushCandidate(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as T;
+    } catch {
+      // try the next candidate
+    }
+  }
+
+  throw new Error(
+    `Invalid JSON in AI response for ${context}. Raw response: ${trimmed.slice(0, 300)}${trimmed.length > 300 ? "..." : ""}`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Intent classification — moment vs instruction
 // ---------------------------------------------------------------------------
@@ -81,8 +124,7 @@ export async function classifyIntent(userText: string, conversationHistory?: str
   const rawContent = response.choices[0]?.message?.content;
   if (!rawContent) throw new Error("Empty AI response for classification");
 
-  const content = rawContent.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
-  const parsed = JSON.parse(content) as ClassifyResult;
+  const parsed = parseJsonResponse<ClassifyResult>(rawContent, "classification");
 
   if (!["moment", "instruction", "unclear"].includes(parsed.intent)) {
     throw new Error(`Invalid intent: ${parsed.intent}`);
@@ -135,10 +177,7 @@ export async function reviewMoment(userText: string): Promise<ReviewResult> {
   const rawContent = response.choices[0]?.message?.content;
   if (!rawContent) throw new Error("Empty AI response");
 
-  // Strip markdown code fences the model sometimes wraps around JSON
-  const content = rawContent.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
-
-  const parsed = JSON.parse(content) as ReviewResult;
+  const parsed = parseJsonResponse<ReviewResult>(rawContent, "moment review");
 
   // Validate structure
   if (!["publish", "suggest"].includes(parsed.action)) {
@@ -232,8 +271,7 @@ export async function executeInstruction(
   const rawContent = response.choices[0]?.message?.content;
   if (!rawContent) throw new Error("Empty AI response for instruction");
 
-  const content = rawContent.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
-  const parsed = JSON.parse(content) as InstructionResult;
+  const parsed = parseJsonResponse<InstructionResult>(rawContent, "instruction execution");
 
   if (!["edit", "unclear", "unsupported"].includes(parsed.action)) {
     throw new Error(`Invalid instruction action: ${parsed.action}`);
