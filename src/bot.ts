@@ -10,7 +10,7 @@
 
 import { App, BlockAction, ButtonAction } from "@slack/bolt";
 import { config } from "./config";
-import { reviewMoment, craftMoment, classifyIntent, executeInstruction } from "./ai";
+import { reviewMoment, craftMoment, classifyIntent, executeInstruction, respondToProposalFollowUp } from "./ai";
 import { addMoment, getTodayEntries, todaySlug, uploadImage, getRecentMoments, updateMomentFile, type MomentFile } from "./github";
 import { convertSlackEmoji } from "./slack-emoji";
 import { extractImageFiles, processMessageImages, type ProcessedImage } from "./images";
@@ -26,6 +26,10 @@ interface PendingProposal {
   text: string;
   /** Markdown embed strings for uploaded images (already on GitHub) */
   imageEmbeds: string[];
+  /** The user's original (unedited) text */
+  originalText: string;
+  /** AI explanation of what was changed */
+  explanation: string;
 }
 const pendingProposals = new Map<string, PendingProposal>();
 
@@ -241,7 +245,7 @@ app.action<BlockAction<ButtonAction>>("treat_as_moment", async ({ ack, body, cli
     }
   };
 
-  await processAsMoment(pending.text, pending.message, hasImages, sayViaClient);
+  await processAsMoment(pending.text, pending.message, hasImages, sayViaClient, userId);
 });
 
 app.action<BlockAction<ButtonAction>>("treat_as_instruction", async ({ ack, body, client }) => {
@@ -352,6 +356,7 @@ app.action<BlockAction<ButtonAction>>("publish_original", async ({ ack, body, cl
   const imageEmbeds = proposal?.imageEmbeds || [];
 
   pendingProposals.delete(userId);
+  clearConversation(userId);
   const fullText = combineTextAndImages(convertSlackEmoji(originalText), imageEmbeds);
   await publishAndConfirm(fullText, body.channel?.id || userId, client);
 });
@@ -384,6 +389,13 @@ async function handleNewMoment(text: string, message: any, say: Function, userId
 
   // Record the user message in history
   addToHistory(userId, "user", text);
+
+
+  // If there's a pending proposal, handle as a follow-up conversation about it
+  if (pendingProposals.has(userId)) {
+    await handleProposalFollowUp(text, userId, message, say);
+    return;
+  }
 
   // If there's conversation history, this might be a follow-up to a clarification.
   // Let the classifier see the history to make a better decision.
@@ -445,13 +457,60 @@ async function handleNewMoment(text: string, message: any, say: Function, userId
     console.error(`[ai] classification failed, defaulting to moment: ${err.message}`);
   }
 
-  // Process as a moment — clear conversation since we're publishing
-  clearConversation(userId);
-  await processAsMoment(text, message, hasImages, say);
+  // Process as a moment (conversation is cleared on publish, preserved on suggest for follow-ups)
+  await processAsMoment(text, message, hasImages, say, userId);
 }
 
+/** Handle a follow-up message when there's a pending proposal. */
+async function handleProposalFollowUp(text: string, userId: string, message: any, say: Function) {
+  const proposal = pendingProposals.get(userId);
+  if (!proposal) return; // shouldn't happen, but safety check
+
+  const history = formatHistory(userId);
+
+  await say("🔧 Working on your request...");
+
+  try {
+    console.log(`[ai] handling proposal follow-up...`);
+    const start = Date.now();
+    const result = await respondToProposalFollowUp(text, {
+      originalText: proposal.originalText,
+      suggestedText: proposal.text,
+      imageEmbeds: proposal.imageEmbeds,
+      conversationHistory: history,
+    });
+    console.log(`[ai] follow-up done in ${Date.now() - start}ms — action=${result.action}`);
+
+    if (result.action === "answer") {
+      addToHistory(userId, "bot", result.response);
+      await say(result.response);
+    } else if (result.action === "revise") {
+      // Update the pending proposal with the revised text
+      pendingProposals.set(userId, {
+        ...proposal,
+        text: result.revisedText,
+        explanation: result.response,
+      });
+      addToHistory(userId, "bot", `Revised proposal: ${result.response}`);
+      await proposeSuggestion(proposal.originalText, result.revisedText, result.response, proposal.imageEmbeds, say);
+    } else if (result.action === "new_moment") {
+      // User sent something unrelated — discard proposal and process as a new moment
+      pendingProposals.delete(userId);
+      clearConversation(userId);
+      addToHistory(userId, "user", text);
+      const hasImages = "files" in message && extractImageFiles(message).length > 0;
+      await processAsMoment(text, message, hasImages, say, userId);
+    }
+  } catch (err: any) {
+    console.error("Error in proposal follow-up:", err);
+    await say(`❌ Something went wrong: ${err.message}`);
+  }
+}
+
+
 /** Process text (and optional images) as a moment — review with AI and publish. */
-async function processAsMoment(text: string, message: any, hasImages: boolean, say: Function) {
+async function processAsMoment(text: string, message: any, hasImages: boolean, say: Function, userId?: string) {
+  const uid = userId || config.authorizedUserId;
   const hasText = text.length > 0;
 
   if (hasImages && hasText) {
@@ -485,9 +544,11 @@ async function processAsMoment(text: string, message: any, hasImages: boolean, s
       if (hasText) {
         console.warn(`[images] all images failed, publishing text only`);
         if (review && review.action === "publish") {
+          clearConversation(uid);
           await publishAndNotify(review.text, say);
           await say("⚠️ Couldn't include the image(s), but your text was published.");
         } else if (review) {
+          addToHistory(uid, "bot", "Suggested edits: " + review.explanation);
           await proposeSuggestion(text, review.text, review.explanation, [], say);
           await say("⚠️ Couldn't process the image(s). They won't be included.");
         }
@@ -499,6 +560,7 @@ async function processAsMoment(text: string, message: any, hasImages: boolean, s
 
     // Image-only moment (no text, no AI review)
     if (!hasText) {
+      clearConversation(uid);
       const fullText = imageEmbeds.join("\n\n");
       await publishAndNotify(fullText, say);
       return;
@@ -506,9 +568,11 @@ async function processAsMoment(text: string, message: any, hasImages: boolean, s
 
     // Text + optional images
     if (review!.action === "publish") {
+      clearConversation(uid);
       const fullText = combineTextAndImages(review!.text, imageEmbeds);
       await publishAndNotify(fullText, say);
     } else {
+      addToHistory(uid, "bot", "Suggested edits: " + review!.explanation);
       await proposeSuggestion(text, review!.text, review!.explanation, imageEmbeds, say);
     }
   } catch (err: any) {
@@ -739,7 +803,7 @@ async function publishAndConfirm(text: string, channel: string, client: any) {
 async function proposeSuggestion(original: string, suggested: string, explanation: string, imageEmbeds: string[], say: Function) {
   // Store the suggestion and image embeds for the accept/publish-original actions
   // We use the authorized user ID since there's only one user
-  pendingProposals.set(config.authorizedUserId, { text: suggested, imageEmbeds });
+  pendingProposals.set(config.authorizedUserId, { text: suggested, imageEmbeds, originalText: original, explanation });
 
   await say({
     text: "I have a suggestion for your moment",
@@ -793,7 +857,7 @@ async function proposeSuggestion(original: string, suggested: string, explanatio
 }
 
 async function proposeCrafted(crafted: string, say: Function) {
-  pendingProposals.set(config.authorizedUserId, { text: crafted, imageEmbeds: [] });
+  pendingProposals.set(config.authorizedUserId, { text: crafted, imageEmbeds: [], originalText: crafted, explanation: "Crafted from your idea" });
 
   await say({
     text: "Here's a crafted moment for you",

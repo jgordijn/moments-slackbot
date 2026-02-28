@@ -302,3 +302,94 @@ export async function craftMoment(roughIdea: string): Promise<string> {
 
   return response.choices[0]?.message?.content?.trim() || roughIdea;
 }
+
+
+// ---------------------------------------------------------------------------
+// Proposal follow-up conversation
+// ---------------------------------------------------------------------------
+
+export interface ProposalContext {
+  originalText: string;
+  suggestedText: string;
+  imageEmbeds: string[];
+  conversationHistory: string;
+}
+
+export interface ProposalFollowUpResult {
+  /** "answer" = respond to a question, "revise" = update the proposal, "new_moment" = unrelated new moment */
+  action: "answer" | "revise" | "new_moment";
+  /** Response to show the user (for "answer"), or explanation of changes (for "revise") */
+  response: string;
+  /** Updated moment text (only for "revise", empty otherwise) */
+  revisedText: string;
+}
+
+const PROPOSAL_FOLLOWUP_SYSTEM_PROMPT = `You are a writing assistant for a personal microblog called "Moments".
+
+The user previously sent a moment to publish. The system reviewed it, possibly suggested edits, and is now showing a proposal with accept/reject buttons.
+Instead of clicking a button, the user sent a follow-up message. They might be:
+- Asking a question about the proposal or what was changed
+- Requesting changes or adjustments to the proposed text
+- Giving feedback that requires a revision
+- Sending a completely new, unrelated message (rare)
+
+You will receive:
+- The original text the user submitted
+- The current proposed text (what would be published if they accept)
+- Any image embeds that will be appended to the moment
+- The conversation history so far
+
+Your job:
+1. If the user asks a question about the proposal → answer it clearly using "answer" action. Be specific — reference the actual text and changes.
+2. If the user wants changes → create a revised version using "revise" action. Return the COMPLETE moment text (not just the changed part). If image embeds are provided and the user asks about image placement, incorporate the image embed into the text at the right position instead of just appending it.
+3. If the message is clearly a brand new, unrelated moment (not about the pending proposal at all) → use "new_moment" action.
+
+Important notes about image handling:
+- Image embeds look like: ![description](/images/moments/filename.jpg)
+- By default, images are appended at the end of the moment text after publishing. If the user indicated where an image should go (e.g., with a placeholder like [[image here]] or similar), place the image embed there instead.
+- When revising, include image embeds inline in the text at the correct position.
+- If the user asks whether the image is in the right place, explain where it will end up and offer to revise if needed.
+
+Respond ONLY with valid JSON:
+{
+  "action": "answer" | "revise" | "new_moment",
+  "response": "your response to show the user",
+  "revisedText": "the complete revised moment text (only for revise, empty otherwise)"
+}`;
+
+export async function respondToProposalFollowUp(
+  userMessage: string,
+  context: ProposalContext,
+): Promise<ProposalFollowUpResult> {
+  const contextParts = [
+    `Original text from user:\n${context.originalText}`,
+    `Current proposed text:\n${context.suggestedText}`,
+    context.imageEmbeds.length > 0
+      ? `Image embeds (will be included in the moment):\n${context.imageEmbeds.join("\n")}`
+      : null,
+    context.conversationHistory
+      ? `Conversation history:\n${context.conversationHistory}`
+      : null,
+  ].filter(Boolean).join("\n\n---\n\n");
+
+  const response = await openai.chat.completions.create({
+    model: config.aiModel,
+    temperature: 0.3,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: PROPOSAL_FOLLOWUP_SYSTEM_PROMPT },
+      { role: "user", content: `${contextParts}\n\n---\n\nUser's follow-up message: ${userMessage}` },
+    ],
+  });
+
+  const rawContent = response.choices[0]?.message?.content;
+  if (!rawContent) throw new Error("Empty AI response for proposal follow-up");
+
+  const parsed = parseJsonResponse<ProposalFollowUpResult>(rawContent, "proposal follow-up");
+
+  if (!["answer", "revise", "new_moment"].includes(parsed.action)) {
+    throw new Error(`Invalid proposal follow-up action: ${parsed.action}`);
+  }
+
+  return parsed;
+}
